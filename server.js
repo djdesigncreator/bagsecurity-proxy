@@ -181,3 +181,534 @@ function classificar(ext) {
   }
   return 'Other';
 }
+
+/* ============ SERVIDOR ============ */
+
+const servidor = http.createServer(function (req, res) {
+
+  const url = new URL(req.url, 'http://localhost');
+  const rota = url.pathname;
+  const metodo = req.method.toUpperCase();
+
+  if (metodo === 'OPTIONS') {
+    res.writeHead(204, CORS);
+    res.end();
+    return;
+  }
+
+  /* ---------- estado ---------- */
+  if (rota === '/' || rota === '') {
+    return responder(res, 200, {
+      servico: 'bagsecurity-proxy',
+      versao: 'container-3',
+      storage: Boolean(ZONE && PASS && HOST),
+      bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
+      cdn_assinado: Boolean(CDN_KEY)
+    });
+  }
+
+  /* ---------- 1. pedir token de upload ---------- */
+  if (rota === '/token' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      const nome = limpar(p.name);
+      const tamanho = parseInt(String(p.size || '0').replace(/[^0-9]/g, ''), 10);
+      const pasta = limpar(p.folder);
+      const pedidoDono = String(p.owner || '').trim();
+
+      if (!nome) return responder(res, 400, { erro: 'Nome em falta.' });
+      if (!tamanho || tamanho <= 0) return responder(res, 400, { erro: 'Tamanho invalido.' });
+      if (!pedidoDono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      carregarUtilizador(pedidoDono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        if (u.maxFicheiro > 0 && tamanho > u.maxFicheiro) {
+          return responder(res, 403, { erro: 'Ficheiro acima do limite do plano.' });
+        }
+        if (u.limite > 0 && tamanho > (u.limite - u.usado)) {
+          return responder(res, 403, { erro: 'Sem espaco suficiente.' });
+        }
+
+        const dono = limpar(u.id);
+        const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + nome;
+        const caminho = dono + (pasta ? '/' + pasta : '') + '/' + unico;
+        const expira = Math.floor(Date.now() / 1000) + 7200;
+        const token = expira + '.' + tamanho + '.' + assinar(caminho + '|' + expira + '|' + tamanho);
+
+        responder(res, 200, { ok: true, token: token, path: caminho, expires: expira });
+      });
+    });
+  }
+
+  /* ---------- 2. enviar em streaming ---------- */
+  if (rota === '/upload' && (metodo === 'POST' || metodo === 'PUT')) {
+
+    if (!ZONE || !PASS || !HOST || !SEGREDO) {
+      return responder(res, 500, { erro: 'Configuracao incompleta.' });
+    }
+
+    const token = req.headers['x-bsu-token'] || '';
+    const caminho = limpar(req.headers['x-bsu-path'] || '');
+    const tipo = req.headers['x-bsu-type'] || 'application/octet-stream';
+
+    if (!token) return responder(res, 403, { erro: 'Token em falta.' });
+    if (!caminho) return responder(res, 400, { erro: 'Caminho em falta.' });
+
+    const partes = String(token).split('.');
+    if (partes.length !== 3) return responder(res, 403, { erro: 'Token mal formado.' });
+
+    const expira = Number(partes[0]);
+    const tamanho = Number(partes[1]);
+
+    if (!expira || !tamanho) return responder(res, 403, { erro: 'Token mal formado.' });
+    if (Math.floor(Date.now() / 1000) > expira) return responder(res, 403, { erro: 'Token expirado.' });
+    if (!iguais(partes[2], assinar(caminho + '|' + expira + '|' + tamanho))) {
+      return responder(res, 403, { erro: 'Token invalido.' });
+    }
+
+    const declarado = Number(req.headers['content-length'] || 0);
+    if (declarado > 0 && declarado > tamanho + 4096) {
+      return responder(res, 403, { erro: 'Tamanho nao autorizado.' });
+    }
+
+    const opcoes = {
+      hostname: HOST,
+      path: '/' + ZONE + '/' + encodeURI(caminho),
+      method: 'PUT',
+      headers: { 'AccessKey': PASS, 'Content-Type': tipo }
+    };
+    if (req.headers['content-length']) {
+      opcoes.headers['Content-Length'] = req.headers['content-length'];
+    } else {
+      opcoes.headers['Transfer-Encoding'] = 'chunked';
+    }
+
+    const pedido = https.request(opcoes, function (bunny) {
+      let corpo = '';
+      bunny.on('data', function (c) { corpo += c; });
+      bunny.on('end', function () {
+        if (bunny.statusCode !== 201 && bunny.statusCode !== 200) {
+          return responder(res, 502, { erro: 'Bunny respondeu ' + bunny.statusCode });
+        }
+        responder(res, 200, { ok: true, caminho: caminho });
+      });
+    });
+
+    pedido.on('error', function (e) {
+      responder(res, 502, { erro: 'Falha ao contactar o Bunny.', detalhe: String(e.message) });
+    });
+    req.on('error', function () { pedido.destroy(); });
+    req.pipe(pedido);
+    return;
+  }
+
+  /* ---------- 3. registar na base de dados ---------- */
+  if (rota === '/create' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      const dono = String(p.owner || '').trim();
+      const caminho = limpar(p.path);
+      const tamanho = parseInt(String(p.size || '0').replace(/[^0-9]/g, ''), 10);
+
+      if (!dono || !caminho || !tamanho) {
+        return responder(res, 400, { erro: 'Dados em falta.' });
+      }
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        if (caminho.indexOf(limpar(u.id) + '/') !== 0) {
+          return responder(res, 403, { erro: 'Caminho nao pertence ao utilizador.' });
+        }
+
+        const ext = String(p.extension || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const registo = {
+          'Owner': u.id,
+          'Name': caminho.split('/').pop(),
+          'Original Name': limparNome(p.original_name),
+          'Extension': ext,
+          'MIME Type': String(p.mime || '').substring(0, 120),
+          'File Type': classificar(ext),
+          'Storage Type': 'Bunny Storage',
+          'Status': 'Ready',
+          'Size Bytes': tamanho,
+          'Bunny Path': caminho,
+          'CDN URL': CDN ? 'https://' + CDN + '/' + encodeURI(caminho) : '',
+          'Is Deleted': false,
+          'Is Shared': false
+        };
+        if (p.folder_id) registo['Folder'] = String(p.folder_id);
+
+        bubble('POST', '/stored file', registo, function (e3, j) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          bubble('PATCH', '/user/' + encodeURIComponent(u.id), {
+            'Storage Used Bytes': u.usado + tamanho
+          }, function () {
+            responder(res, 200, {
+              ok: true,
+              id: j.id || '',
+              usado: u.usado + tamanho,
+              limite: u.limite
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 4. listar ---------- */
+  if (rota === '/files' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      const dono = String(p.owner || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const lixo = p.trash === true;
+        const cf = [
+          { key: 'Owner', constraint_type: 'equals', value: u.id },
+          { key: 'Is Deleted', constraint_type: 'equals', value: lixo }
+        ];
+
+        if (!lixo) {
+          if (p.folder_id) cf.push({ key: 'Folder', constraint_type: 'equals', value: String(p.folder_id) });
+          else cf.push({ key: 'Folder', constraint_type: 'is_empty' });
+          if (p.type) cf.push({ key: 'File Type', constraint_type: 'equals', value: String(p.type) });
+        }
+
+        const cp = [
+          { key: 'Owner', constraint_type: 'equals', value: u.id },
+          { key: 'Is Deleted', constraint_type: 'equals', value: false }
+        ];
+        if (!lixo) {
+          if (p.folder_id) cp.push({ key: 'Parent Folder', constraint_type: 'equals', value: String(p.folder_id) });
+          else cp.push({ key: 'Parent Folder', constraint_type: 'is_empty' });
+        }
+
+        bubble('GET', '/stored file' + constraints(cf) + '&limit=100&sort_field=Created Date&descending=true', null, function (e3, jf) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          const ficheiros = (((jf || {}).response || {}).results || []).map(function (f) {
+            return {
+              id: f._id,
+              nome: f['Original Name'] || f['Name'] || '',
+              ext: f['Extension'] || '',
+              tipo: f['File Type'] || 'Other',
+              mime: f['MIME Type'] || '',
+              tamanho: Number(f['Size Bytes'] || 0),
+              caminho: f['Bunny Path'] || '',
+              url: urlAssinado(f['Bunny Path'] || '', 3600),
+              partilhado: f['Is Shared'] === true,
+              criado: f['Created Date'] || ''
+            };
+          });
+
+          if (lixo) {
+            return responder(res, 200, {
+              ok: true, pastas: [], ficheiros: ficheiros,
+              usado: u.usado, limite: u.limite
+            });
+          }
+
+          bubble('GET', '/folder' + constraints(cp) + '&limit=100&sort_field=Name', null, function (e4, jp) {
+            const pastas = e4 ? [] : (((jp || {}).response || {}).results || []).map(function (d) {
+              return { id: d._id, nome: d['Name'] || '', caminho: d['Path'] || '' };
+            });
+            responder(res, 200, {
+              ok: true, pastas: pastas, ficheiros: ficheiros,
+              usado: u.usado, limite: u.limite
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 5. apagar (para a lixeira) ---------- */
+  if (rota === '/delete' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
+          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
+          const f = (jf && jf.response) || jf;
+          if (String(f['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
+          }
+
+          const definitivo = p.permanent === true;
+
+          if (!definitivo) {
+            return bubble('PATCH', '/stored file/' + encodeURIComponent(id), {
+              'Is Deleted': true,
+              'Deleted Date': new Date().toISOString()
+            }, function (e4) {
+              if (e4) return responder(res, 502, { erro: e4.message });
+              responder(res, 200, { ok: true, lixeira: true });
+            });
+          }
+
+          apagarNoBunny(f['Bunny Path'] || '', function () {
+            bubble('DELETE', '/stored file/' + encodeURIComponent(id), null, function (e5) {
+              if (e5) return responder(res, 502, { erro: e5.message });
+              const novo = Math.max(0, u.usado - Number(f['Size Bytes'] || 0));
+              bubble('PATCH', '/user/' + encodeURIComponent(u.id), { 'Storage Used Bytes': novo }, function () {
+                responder(res, 200, { ok: true, definitivo: true, usado: novo });
+              });
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 6. restaurar ---------- */
+  if (rota === '/restore' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
+          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
+          const f = (jf && jf.response) || jf;
+          if (String(f['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
+          }
+          bubble('PATCH', '/stored file/' + encodeURIComponent(id), { 'Is Deleted': false }, function (e4) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 7. renomear ---------- */
+  if (rota === '/rename' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      const nome = limparNome(p.name);
+      const ePasta = p.folder === true;
+      if (!dono || !id || !nome) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        const tipo = ePasta ? '/folder/' : '/stored file/';
+        bubble('GET', tipo + encodeURIComponent(id), null, function (e3, j) {
+          if (e3) return responder(res, 404, { erro: 'Nao encontrado.' });
+          const d = (j && j.response) || j;
+          if (String(d['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Nao e teu.' });
+          }
+          const campo = ePasta ? { 'Name': nome } : { 'Original Name': nome };
+          bubble('PATCH', tipo + encodeURIComponent(id), campo, function (e4) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true, nome: nome });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 8. mover ---------- */
+  if (rota === '/move' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
+          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
+          const f = (jf && jf.response) || jf;
+          if (String(f['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
+          }
+          const alvo = p.folder_id ? String(p.folder_id) : null;
+          bubble('PATCH', '/stored file/' + encodeURIComponent(id), { 'Folder': alvo }, function (e4) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 9. criar pasta ---------- */
+  if (rota === '/folder' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const nome = limparNome(p.name);
+      if (!dono || !nome) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        function criar(caminhoPai) {
+          const registo = {
+            'Name': nome,
+            'Owner': u.id,
+            'Path': (caminhoPai ? caminhoPai + '/' : '') + limpar(nome),
+            'Is Deleted': false
+          };
+          if (p.parent_id) registo['Parent Folder'] = String(p.parent_id);
+          bubble('POST', '/folder', registo, function (e4, j) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true, id: j.id || '', nome: nome, caminho: registo['Path'] });
+          });
+        }
+
+        if (!p.parent_id) return criar('');
+        bubble('GET', '/folder/' + encodeURIComponent(p.parent_id), null, function (e5, jp) {
+          const d = e5 ? null : ((jp && jp.response) || jp);
+          criar(d ? (d['Path'] || '') : '');
+        });
+      });
+    });
+  }
+
+  /* ---------- 10. partilhar ---------- */
+  if (rota === '/share' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
+          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
+          const f = (jf && jf.response) || jf;
+          if (String(f['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
+          }
+
+          if (p.revoke === true) {
+            return bubble('PATCH', '/stored file/' + encodeURIComponent(id), {
+              'Is Shared': false, 'Share Token': ''
+            }, function () { responder(res, 200, { ok: true, revogado: true }); });
+          }
+
+          const chave = crypto.randomBytes(16).toString('hex');
+          const dias = Math.min(365, Math.max(1, parseInt(p.days || '7', 10)));
+          const ate = new Date(Date.now() + dias * 86400000).toISOString();
+
+          const mudanca = {
+            'Is Shared': true,
+            'Share Token': chave,
+            'Share Expires': ate,
+            'Share Downloads': 0
+          };
+          if (p.max_downloads) mudanca['Share Max Downloads'] = parseInt(p.max_downloads, 10) || 0;
+          if (p.password) mudanca['Share Password'] = String(p.password).substring(0, 60);
+
+          bubble('PATCH', '/stored file/' + encodeURIComponent(id), mudanca, function (e4) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true, token: chave, expira: ate });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 11. abrir partilha ---------- */
+  if (rota === '/shared' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const chave = String(p.token || '').trim();
+      if (!chave) return responder(res, 400, { erro: 'Token em falta.' });
+
+      const c = [
+        { key: 'Share Token', constraint_type: 'equals', value: chave },
+        { key: 'Is Shared', constraint_type: 'equals', value: true },
+        { key: 'Is Deleted', constraint_type: 'equals', value: false }
+      ];
+
+      bubble('GET', '/stored file' + constraints(c) + '&limit=1', null, function (e2, j) {
+        if (e2) return responder(res, 502, { erro: e2.message });
+        const lista = (((j || {}).response || {}).results || []);
+        if (!lista.length) return responder(res, 404, { erro: 'Link invalido.' });
+        const f = lista[0];
+
+        if (f['Share Expires'] && new Date(f['Share Expires']) < new Date()) {
+          return responder(res, 410, { erro: 'Este link expirou.' });
+        }
+        const max = Number(f['Share Max Downloads'] || 0);
+        const feitos = Number(f['Share Downloads'] || 0);
+        if (max > 0 && feitos >= max) {
+          return responder(res, 410, { erro: 'Limite de downloads atingido.' });
+        }
+        if (f['Share Password'] && String(p.password || '') !== f['Share Password']) {
+          return responder(res, 401, { erro: 'Password incorreta.', precisa_password: true });
+        }
+
+        bubble('PATCH', '/stored file/' + encodeURIComponent(f._id), {
+          'Share Downloads': feitos + 1
+        }, function () {
+          responder(res, 200, {
+            ok: true,
+            nome: f['Original Name'] || f['Name'] || '',
+            tipo: f['File Type'] || 'Other',
+            ext: f['Extension'] || '',
+            tamanho: Number(f['Size Bytes'] || 0),
+            url: urlAssinado(f['Bunny Path'] || '', 3600)
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- 12. link assinado ---------- */
+  if (rota === '/link' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
+          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
+          const f = (jf && jf.response) || jf;
+          if (String(f['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
+          }
+          responder(res, 200, { ok: true, url: urlAssinado(f['Bunny Path'] || '', 3600) });
+        });
+      });
+    });
+  }
+
+  responder(res, 404, { erro: 'Caminho desconhecido.', rota: rota });
+});
+
+servidor.timeout = 0;
+servidor.headersTimeout = 0;
+servidor.requestTimeout = 0;
+
+servidor.listen(PORTA, function () {
+  console.log('bagsecurity-proxy a escutar na porta ' + PORTA);
+});
