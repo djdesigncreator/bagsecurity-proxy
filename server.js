@@ -7,13 +7,14 @@ const PASS = process.env.STORAGE_PASSWORD || '';
 const HOST = (process.env.STORAGE_HOST || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
 const CDN = (process.env.CDN_HOST || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
 const SEGREDO = process.env.UPLOAD_SECRET || '';
-const BUBBLE_API = (process.env.BUBBLE_API || '').replace(/\/+$/, '');
+const CDN_KEY = process.env.CDN_TOKEN_KEY || '';
+const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_TOKEN = process.env.BUBBLE_TOKEN || '';
 const PORTA = process.env.PORT || 8080;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, PUT, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': '*',
   'Access-Control-Max-Age': '86400'
 };
@@ -32,6 +33,10 @@ function limpar(bruto) {
     .join('/');
 }
 
+function limparNome(bruto) {
+  return String(bruto || '').trim().replace(/[\/\\<>:"|?*\u0000-\u001F]/g, '').substring(0, 200);
+}
+
 function assinar(base) {
   return crypto.createHmac('sha256', SEGREDO).update(base).digest('hex');
 }
@@ -47,206 +52,132 @@ function lerJson(req, cb) {
   let total = 0;
   req.on('data', function (c) {
     total += c.length;
-    if (total > 1048576) { req.destroy(); return; }
+    if (total > 2097152) { req.destroy(); return; }
     dados += c;
   });
   req.on('end', function () {
+    if (!dados) return cb(null, {});
     try { cb(null, JSON.parse(dados)); }
     catch (e) { cb(e); }
   });
   req.on('error', function (e) { cb(e); });
 }
 
-/* pergunta ao Bubble quem e o utilizador e quanto espaco tem */
-function validarUtilizador(id, cb) {
-  if (!BUBBLE_API || !BUBBLE_TOKEN) {
-    return cb(new Error('Validacao do Bubble nao configurada.'));
+/* ============ ponte para a Data API do Bubble ============ */
+
+function bubble(metodo, caminho, corpo, cb) {
+  if (!BUBBLE_BASE || !BUBBLE_TOKEN) {
+    return cb(new Error('Data API nao configurada.'));
   }
 
-  const alvo = BUBBLE_API + '/' + encodeURIComponent(id);
-  const u = new URL(alvo);
+  const alvo = BUBBLE_BASE + caminho;
+  let u;
+  try { u = new URL(alvo); } catch (e) { return cb(new Error('URL invalido.')); }
 
-  const pedido = https.request({
+  const payload = corpo ? JSON.stringify(corpo) : null;
+
+  const opcoes = {
     hostname: u.hostname,
     path: u.pathname + u.search,
-    method: 'GET',
-    headers: { 'Authorization': 'Bearer ' + BUBBLE_TOKEN }
-  }, function (r) {
-    let corpo = '';
-    r.on('data', function (c) { corpo += c; });
+    method: metodo,
+    headers: {
+      'Authorization': 'Bearer ' + BUBBLE_TOKEN,
+      'Content-Type': 'application/json'
+    }
+  };
+  if (payload) opcoes.headers['Content-Length'] = Buffer.byteLength(payload);
+
+  const pedido = https.request(opcoes, function (r) {
+    let texto = '';
+    r.on('data', function (c) { texto += c; });
     r.on('end', function () {
-      if (r.statusCode !== 200) {
-        return cb(new Error('Utilizador nao encontrado (' + r.statusCode + ').'));
+      if (r.statusCode < 200 || r.statusCode >= 300) {
+        return cb(new Error('Bubble ' + r.statusCode + ': ' + texto.substring(0, 160)));
       }
-      try {
-        const j = JSON.parse(corpo);
-        const d = j.response || j;
-        cb(null, {
-          id: d._id || id,
-          limite: Number(d['Storage Limit Bytes'] || d.storage_limit_bytes || 0),
-          usado: Number(d['Storage Used Bytes'] || d.storage_used_bytes || 0),
-          maxFicheiro: Number(d['Max File Size Bytes'] || d.max_file_size_bytes || 0)
-        });
-      } catch (e) {
-        cb(new Error('Resposta do Bubble ilegivel.'));
-      }
+      if (!texto) return cb(null, {});
+      try { cb(null, JSON.parse(texto)); }
+      catch (e) { cb(null, {}); }
     });
   });
 
-  pedido.setTimeout(10000, function () { pedido.destroy(); });
+  pedido.setTimeout(20000, function () { pedido.destroy(new Error('Bubble demorou demasiado.')); });
   pedido.on('error', function (e) { cb(e); });
+  if (payload) pedido.write(payload);
   pedido.end();
 }
 
-const servidor = http.createServer(function (req, res) {
+function constraints(lista) {
+  return '?constraints=' + encodeURIComponent(JSON.stringify(lista));
+}
 
-  const url = new URL(req.url, 'http://localhost');
+/* ============ utilizador ============ */
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, CORS);
-    res.end();
-    return;
-  }
-
-  if (url.pathname === '/' || url.pathname === '') {
-    responder(res, 200, {
-      servico: 'bagsecurity-proxy',
-      versao: 'container-2',
-      pronto: Boolean(ZONE && PASS && HOST && SEGREDO),
-      valida_utilizador: Boolean(BUBBLE_API && BUBBLE_TOKEN)
+function carregarUtilizador(id, cb) {
+  bubble('GET', '/user/' + encodeURIComponent(id), null, function (e, j) {
+    if (e) return cb(e);
+    const d = (j && j.response) || j;
+    if (!d || !d._id) return cb(new Error('Utilizador nao encontrado.'));
+    cb(null, {
+      id: d._id,
+      limite: Number(d['Storage Limit Bytes'] || 0),
+      usado: Number(d['Storage Used Bytes'] || 0),
+      maxFicheiro: Number(d['Max File Size Bytes'] || 0),
+      plano: d['Plan'] || ''
     });
-    return;
+  });
+}
+
+/* ============ URL assinado do CDN ============ */
+
+function urlAssinado(caminho, segundos) {
+  const limpo = '/' + encodeURI(caminho);
+  if (!CDN) return '';
+  if (!CDN_KEY) return 'https://' + CDN + limpo;
+
+  const expira = Math.floor(Date.now() / 1000) + (segundos || 3600);
+  const base = CDN_KEY + limpo + expira;
+
+  const hash = crypto.createHash('sha256').update(base).digest('base64')
+    .replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+  return 'https://' + CDN + limpo + '?token=' + hash + '&expires=' + expira;
+}
+
+/* ============ apagar no Bunny Storage ============ */
+
+function apagarNoBunny(caminho, cb) {
+  const opcoes = {
+    hostname: HOST,
+    path: '/' + ZONE + '/' + encodeURI(caminho),
+    method: 'DELETE',
+    headers: { 'AccessKey': PASS }
+  };
+  const p = https.request(opcoes, function (r) {
+    r.resume();
+    r.on('end', function () { cb(null, r.statusCode); });
+  });
+  p.setTimeout(15000, function () { p.destroy(); });
+  p.on('error', function (e) { cb(e); });
+  p.end();
+}
+
+/* ============ classificar por extensao ============ */
+
+const TIPOS = {
+  Video: ['mp4','mov','webm','avi','mkv','m4v','mpg','mpeg','wmv','flv'],
+  Image: ['jpg','jpeg','png','gif','svg','webp','bmp','ico','heic','avif'],
+  Audio: ['mp3','wav','ogg','m4a','aac','flac','wma'],
+  Document: ['pdf','doc','docx','odt','rtf','pages'],
+  Spreadsheet: ['xls','xlsx','csv','ods','numbers'],
+  Presentation: ['ppt','pptx','odp','key'],
+  Archive: ['zip','rar','7z','tar','gz','bz2','iso','dmg'],
+  Text: ['txt','md','json','xml','log','yml','yaml']
+};
+
+function classificar(ext) {
+  const e = String(ext || '').toLowerCase();
+  for (const k in TIPOS) {
+    if (TIPOS[k].indexOf(e) !== -1) return k;
   }
-
-  if (url.pathname === '/token' && req.method === 'POST') {
-    if (!SEGREDO) { responder(res, 500, { erro: 'Configuracao incompleta.' }); return; }
-
-    lerJson(req, function (err, p) {
-      if (err || !p) { responder(res, 400, { erro: 'JSON invalido.' }); return; }
-
-      const nome = limpar(p.name);
-      const tamanho = parseInt(String(p.size || '0').replace(/[^0-9]/g, ''), 10);
-      const pasta = limpar(p.folder);
-      const pedido_dono = limpar(p.owner);
-
-      if (!nome) { responder(res, 400, { erro: 'Nome em falta.' }); return; }
-      if (!tamanho || tamanho <= 0) { responder(res, 400, { erro: 'Tamanho invalido.' }); return; }
-      if (!pedido_dono) { responder(res, 403, { erro: 'Utilizador em falta.' }); return; }
-
-      validarUtilizador(pedido_dono, function (e2, u) {
-        if (e2) { responder(res, 403, { erro: e2.message }); return; }
-
-        const dono = limpar(u.id);
-        if (!dono) { responder(res, 403, { erro: 'Utilizador invalido.' }); return; }
-
-        if (u.maxFicheiro > 0 && tamanho > u.maxFicheiro) {
-          responder(res, 403, { erro: 'Ficheiro acima do limite do plano.' });
-          return;
-        }
-
-        if (u.limite > 0) {
-          const livre = u.limite - u.usado;
-          if (tamanho > livre) {
-            responder(res, 403, { erro: 'Sem espaco suficiente.' });
-            return;
-          }
-        }
-
-        const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + nome;
-        const caminho = dono + (pasta ? '/' + pasta : '') + '/' + unico;
-        const expira = Math.floor(Date.now() / 1000) + 7200;
-        const token = expira + '.' + tamanho + '.' + assinar(caminho + '|' + expira + '|' + tamanho);
-
-        responder(res, 200, { ok: true, token: token, path: caminho, expires: expira });
-      });
-    });
-    return;
-  }
-
-  if (url.pathname === '/upload' && (req.method === 'POST' || req.method === 'PUT')) {
-
-    if (!ZONE || !PASS || !HOST || !SEGREDO) {
-      responder(res, 500, { erro: 'Configuracao incompleta.' });
-      return;
-    }
-
-    const token = req.headers['x-bsu-token'] || '';
-    const caminho = limpar(req.headers['x-bsu-path'] || '');
-    const tipo = req.headers['x-bsu-type'] || 'application/octet-stream';
-
-    if (!token) { responder(res, 403, { erro: 'Token em falta.' }); return; }
-    if (!caminho) { responder(res, 400, { erro: 'Caminho em falta.' }); return; }
-
-    const partes = String(token).split('.');
-    if (partes.length !== 3) { responder(res, 403, { erro: 'Token mal formado.' }); return; }
-
-    const expira = Number(partes[0]);
-    const tamanho = Number(partes[1]);
-    const recebida = partes[2];
-
-    if (!expira || !tamanho) { responder(res, 403, { erro: 'Token mal formado.' }); return; }
-    if (Math.floor(Date.now() / 1000) > expira) { responder(res, 403, { erro: 'Token expirado.' }); return; }
-
-    if (!iguais(recebida, assinar(caminho + '|' + expira + '|' + tamanho))) {
-      responder(res, 403, { erro: 'Token invalido.' });
-      return;
-    }
-
-    const declarado = Number(req.headers['content-length'] || 0);
-    if (declarado > 0 && declarado > tamanho + 4096) {
-      responder(res, 403, { erro: 'Tamanho nao corresponde ao autorizado.' });
-      return;
-    }
-
-    const opcoes = {
-      hostname: HOST,
-      path: '/' + ZONE + '/' + encodeURI(caminho),
-      method: 'PUT',
-      headers: { 'AccessKey': PASS, 'Content-Type': tipo }
-    };
-
-    if (req.headers['content-length']) {
-      opcoes.headers['Content-Length'] = req.headers['content-length'];
-    } else {
-      opcoes.headers['Transfer-Encoding'] = 'chunked';
-    }
-
-    const pedido = https.request(opcoes, function (bunny) {
-      let corpo = '';
-      bunny.on('data', function (c) { corpo += c; });
-      bunny.on('end', function () {
-        if (bunny.statusCode !== 201 && bunny.statusCode !== 200) {
-          responder(res, 502, {
-            erro: 'Bunny respondeu ' + bunny.statusCode,
-            detalhe: String(corpo).substring(0, 200)
-          });
-          return;
-        }
-        responder(res, 200, {
-          ok: true,
-          caminho: caminho,
-          cdn_url: CDN ? 'https://' + CDN + '/' + encodeURI(caminho) : ''
-        });
-      });
-    });
-
-    pedido.on('error', function (e) {
-      responder(res, 502, { erro: 'Falha ao contactar o Bunny.', detalhe: String(e.message) });
-    });
-
-    req.on('error', function () { pedido.destroy(); });
-
-    req.pipe(pedido);
-    return;
-  }
-
-  responder(res, 404, { erro: 'Caminho desconhecido.' });
-});
-
-servidor.timeout = 0;
-servidor.headersTimeout = 0;
-servidor.requestTimeout = 0;
-
-servidor.listen(PORTA, function () {
-  console.log('bagsecurity-proxy a escutar na porta ' + PORTA);
-});
+  return 'Other';
+}
