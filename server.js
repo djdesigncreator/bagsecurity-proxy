@@ -7,6 +7,8 @@ const PASS = process.env.STORAGE_PASSWORD || '';
 const HOST = (process.env.STORAGE_HOST || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
 const CDN = (process.env.CDN_HOST || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
 const SEGREDO = process.env.UPLOAD_SECRET || '';
+const BUBBLE_API = (process.env.BUBBLE_API || '').replace(/\/+$/, '');
+const BUBBLE_TOKEN = process.env.BUBBLE_TOKEN || '';
 const PORTA = process.env.PORT || 8080;
 
 const CORS = {
@@ -55,6 +57,47 @@ function lerJson(req, cb) {
   req.on('error', function (e) { cb(e); });
 }
 
+/* pergunta ao Bubble quem e o utilizador e quanto espaco tem */
+function validarUtilizador(id, cb) {
+  if (!BUBBLE_API || !BUBBLE_TOKEN) {
+    return cb(new Error('Validacao do Bubble nao configurada.'));
+  }
+
+  const alvo = BUBBLE_API + '/' + encodeURIComponent(id);
+  const u = new URL(alvo);
+
+  const pedido = https.request({
+    hostname: u.hostname,
+    path: u.pathname + u.search,
+    method: 'GET',
+    headers: { 'Authorization': 'Bearer ' + BUBBLE_TOKEN }
+  }, function (r) {
+    let corpo = '';
+    r.on('data', function (c) { corpo += c; });
+    r.on('end', function () {
+      if (r.statusCode !== 200) {
+        return cb(new Error('Utilizador nao encontrado (' + r.statusCode + ').'));
+      }
+      try {
+        const j = JSON.parse(corpo);
+        const d = j.response || j;
+        cb(null, {
+          id: d._id || id,
+          limite: Number(d['Storage Limit Bytes'] || d.storage_limit_bytes || 0),
+          usado: Number(d['Storage Used Bytes'] || d.storage_used_bytes || 0),
+          maxFicheiro: Number(d['Max File Size Bytes'] || d.max_file_size_bytes || 0)
+        });
+      } catch (e) {
+        cb(new Error('Resposta do Bubble ilegivel.'));
+      }
+    });
+  });
+
+  pedido.setTimeout(10000, function () { pedido.destroy(); });
+  pedido.on('error', function (e) { cb(e); });
+  pedido.end();
+}
+
 const servidor = http.createServer(function (req, res) {
 
   const url = new URL(req.url, 'http://localhost');
@@ -68,8 +111,9 @@ const servidor = http.createServer(function (req, res) {
   if (url.pathname === '/' || url.pathname === '') {
     responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-1',
-      pronto: Boolean(ZONE && PASS && HOST && SEGREDO)
+      versao: 'container-2',
+      pronto: Boolean(ZONE && PASS && HOST && SEGREDO),
+      valida_utilizador: Boolean(BUBBLE_API && BUBBLE_TOKEN)
     });
     return;
   }
@@ -83,20 +127,38 @@ const servidor = http.createServer(function (req, res) {
       const nome = limpar(p.name);
       const tamanho = parseInt(String(p.size || '0').replace(/[^0-9]/g, ''), 10);
       const pasta = limpar(p.folder);
-      const dono = limpar(p.owner);
-      const livre = parseInt(String(p.available || '0').replace(/[^0-9]/g, ''), 10);
+      const pedido_dono = limpar(p.owner);
 
       if (!nome) { responder(res, 400, { erro: 'Nome em falta.' }); return; }
       if (!tamanho || tamanho <= 0) { responder(res, 400, { erro: 'Tamanho invalido.' }); return; }
-      if (!dono) { responder(res, 403, { erro: 'Utilizador em falta.' }); return; }
-      if (livre > 0 && tamanho > livre) { responder(res, 403, { erro: 'Sem espaco suficiente.' }); return; }
+      if (!pedido_dono) { responder(res, 403, { erro: 'Utilizador em falta.' }); return; }
 
-      const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + nome;
-      const caminho = dono + (pasta ? '/' + pasta : '') + '/' + unico;
-      const expira = Math.floor(Date.now() / 1000) + 7200;
-      const token = expira + '.' + tamanho + '.' + assinar(caminho + '|' + expira + '|' + tamanho);
+      validarUtilizador(pedido_dono, function (e2, u) {
+        if (e2) { responder(res, 403, { erro: e2.message }); return; }
 
-      responder(res, 200, { ok: true, token: token, path: caminho, expires: expira });
+        const dono = limpar(u.id);
+        if (!dono) { responder(res, 403, { erro: 'Utilizador invalido.' }); return; }
+
+        if (u.maxFicheiro > 0 && tamanho > u.maxFicheiro) {
+          responder(res, 403, { erro: 'Ficheiro acima do limite do plano.' });
+          return;
+        }
+
+        if (u.limite > 0) {
+          const livre = u.limite - u.usado;
+          if (tamanho > livre) {
+            responder(res, 403, { erro: 'Sem espaco suficiente.' });
+            return;
+          }
+        }
+
+        const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + nome;
+        const caminho = dono + (pasta ? '/' + pasta : '') + '/' + unico;
+        const expira = Math.floor(Date.now() / 1000) + 7200;
+        const token = expira + '.' + tamanho + '.' + assinar(caminho + '|' + expira + '|' + tamanho);
+
+        responder(res, 200, { ok: true, token: token, path: caminho, expires: expira });
+      });
     });
     return;
   }
@@ -127,6 +189,12 @@ const servidor = http.createServer(function (req, res) {
 
     if (!iguais(recebida, assinar(caminho + '|' + expira + '|' + tamanho))) {
       responder(res, 403, { erro: 'Token invalido.' });
+      return;
+    }
+
+    const declarado = Number(req.headers['content-length'] || 0);
+    if (declarado > 0 && declarado > tamanho + 4096) {
+      responder(res, 403, { erro: 'Tamanho nao corresponde ao autorizado.' });
       return;
     }
 
