@@ -20,8 +20,7 @@ const CORS = {
 };
 
 function responder(res, status, obj) {
-  const h = Object.assign({}, CORS, { 'Content-Type': 'application/json' });
-  res.writeHead(status, h);
+  res.writeHead(status, Object.assign({}, CORS, { 'Content-Type': 'application/json' }));
   res.end(JSON.stringify(obj));
 }
 
@@ -63,19 +62,15 @@ function lerJson(req, cb) {
   req.on('error', function (e) { cb(e); });
 }
 
-/* ============ ponte para a Data API do Bubble ============ */
+/* ============ ponte para a Data API ============ */
 
 function bubble(metodo, caminho, corpo, cb) {
-  if (!BUBBLE_BASE || !BUBBLE_TOKEN) {
-    return cb(new Error('Data API nao configurada.'));
-  }
+  if (!BUBBLE_BASE || !BUBBLE_TOKEN) return cb(new Error('Data API nao configurada.'));
 
-  const alvo = BUBBLE_BASE + caminho;
   let u;
-  try { u = new URL(alvo); } catch (e) { return cb(new Error('URL invalido.')); }
+  try { u = new URL(BUBBLE_BASE + caminho); } catch (e) { return cb(new Error('URL invalido.')); }
 
   const payload = corpo ? JSON.stringify(corpo) : null;
-
   const opcoes = {
     hostname: u.hostname,
     path: u.pathname + u.search,
@@ -110,6 +105,23 @@ function constraints(lista) {
   return '?constraints=' + encodeURIComponent(JSON.stringify(lista));
 }
 
+/* busca com paginacao, para contar tudo */
+function buscarTudo(tipo, cs, extra, cb) {
+  const out = [];
+  function pagina(cursor) {
+    const url = tipo + constraints(cs) + '&limit=100&cursor=' + cursor + (extra || '');
+    bubble('GET', url, null, function (e, j) {
+      if (e) return cb(e);
+      const r = (j && j.response) || {};
+      const lista = r.results || [];
+      lista.forEach(function (x) { out.push(x); });
+      if (Number(r.remaining || 0) > 0 && out.length < 3000) return pagina(cursor + lista.length);
+      cb(null, out);
+    });
+  }
+  pagina(0);
+}
+
 /* ============ utilizador ============ */
 
 function carregarUtilizador(id, cb) {
@@ -127,32 +139,30 @@ function carregarUtilizador(id, cb) {
   });
 }
 
-/* ============ URL assinado do CDN ============ */
+/* ============ URL assinado ============ */
 
 function urlAssinado(caminho, segundos) {
-  const limpo = '/' + encodeURI(caminho);
   if (!CDN) return '';
+  const limpo = '/' + encodeURI(caminho);
   if (!CDN_KEY) return 'https://' + CDN + limpo;
 
   const expira = Math.floor(Date.now() / 1000) + (segundos || 3600);
-  const base = CDN_KEY + limpo + expira;
-
-  const hash = crypto.createHash('sha256').update(base).digest('base64')
+  const hash = crypto.createHash('sha256').update(CDN_KEY + limpo + expira).digest('base64')
     .replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 
   return 'https://' + CDN + limpo + '?token=' + hash + '&expires=' + expira;
 }
 
-/* ============ apagar no Bunny Storage ============ */
+/* ============ apagar no Bunny ============ */
 
 function apagarNoBunny(caminho, cb) {
-  const opcoes = {
+  if (!caminho) return cb(null, 404);
+  const p = https.request({
     hostname: HOST,
     path: '/' + ZONE + '/' + encodeURI(caminho),
     method: 'DELETE',
     headers: { 'AccessKey': PASS }
-  };
-  const p = https.request(opcoes, function (r) {
+  }, function (r) {
     r.resume();
     r.on('end', function () { cb(null, r.statusCode); });
   });
@@ -161,7 +171,7 @@ function apagarNoBunny(caminho, cb) {
   p.end();
 }
 
-/* ============ classificar por extensao ============ */
+/* ============ classificar ============ */
 
 const TIPOS = {
   Video: ['mp4','mov','webm','avi','mkv','m4v','mpg','mpeg','wmv','flv'],
@@ -182,6 +192,24 @@ function classificar(ext) {
   return 'Other';
 }
 
+/* ============ mapear ficheiro ============ */
+
+function mapear(f) {
+  return {
+    id: f._id,
+    nome: f['Original Name'] || f['Name'] || '',
+    ext: f['Extension'] || '',
+    tipo: f['File Type'] || 'Other',
+    mime: f['MIME Type'] || '',
+    tamanho: Number(f['Size Bytes'] || 0),
+    caminho: f['Bunny Path'] || '',
+    url: urlAssinado(f['Bunny Path'] || '', 3600),
+    partilhado: f['Is Shared'] === true,
+    pasta: f['Folder'] || '',
+    criado: f['Created Date'] || ''
+  };
+}
+
 /* ============ SERVIDOR ============ */
 
 const servidor = http.createServer(function (req, res) {
@@ -190,24 +218,82 @@ const servidor = http.createServer(function (req, res) {
   const rota = url.pathname;
   const metodo = req.method.toUpperCase();
 
-  if (metodo === 'OPTIONS') {
-    res.writeHead(204, CORS);
-    res.end();
-    return;
-  }
+  if (metodo === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
 
   /* ---------- estado ---------- */
   if (rota === '/' || rota === '') {
     return responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-3',
+      versao: 'container-4',
       storage: Boolean(ZONE && PASS && HOST),
       bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
       cdn_assinado: Boolean(CDN_KEY)
     });
   }
 
-  /* ---------- 1. pedir token de upload ---------- */
+  /* ---------- planos ---------- */
+  if (rota === '/plans' && metodo === 'POST') {
+    const c = [{ key: 'Is Active', constraint_type: 'equals', value: true }];
+    return bubble('GET', '/plan' + constraints(c) + '&limit=50&sort_field=Sort Order', null, function (e, j) {
+      if (e) return responder(res, 502, { erro: e.message });
+      const lista = (((j || {}).response || {}).results || []).map(function (p) {
+        return {
+          id: p._id,
+          nome: p['Name'] || '',
+          label: p['Storage Label'] || '',
+          limite: Number(p['Storage Limit Bytes'] || 0),
+          maxFicheiro: Number(p['Max File Size Bytes'] || 0),
+          preco: Number(p['Price MZN'] || 0),
+          utilizadores: Number(p['Max Users'] || 1),
+          partilha: p['Allows Sharing'] === true,
+          ordem: Number(p['Sort Order'] || 0)
+        };
+      });
+      responder(res, 200, { ok: true, planos: lista });
+    });
+  }
+
+  /* ---------- estatisticas globais ---------- */
+  if (rota === '/stats' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const cs = [
+          { key: 'Owner', constraint_type: 'equals', value: u.id },
+          { key: 'Is Deleted', constraint_type: 'equals', value: false }
+        ];
+
+        buscarTudo('/stored file', cs, '&sort_field=Created Date&descending=true', function (e3, todos) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          const contagem = {}, bytes = {};
+          todos.forEach(function (f) {
+            const t = f['File Type'] || 'Other';
+            contagem[t] = (contagem[t] || 0) + 1;
+            bytes[t] = (bytes[t] || 0) + Number(f['Size Bytes'] || 0);
+          });
+
+          responder(res, 200, {
+            ok: true,
+            total: todos.length,
+            contagem: contagem,
+            bytes: bytes,
+            partilhados: todos.filter(function (f) { return f['Is Shared'] === true; }).length,
+            recentes: todos.slice(0, 8).map(mapear),
+            usado: u.usado,
+            limite: u.limite
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- pedir token ---------- */
   if (rota === '/token' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -223,7 +309,6 @@ const servidor = http.createServer(function (req, res) {
 
       carregarUtilizador(pedidoDono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
-
         if (u.maxFicheiro > 0 && tamanho > u.maxFicheiro) {
           return responder(res, 403, { erro: 'Ficheiro acima do limite do plano.' });
         }
@@ -242,9 +327,8 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 2. enviar em streaming ---------- */
+  /* ---------- enviar ---------- */
   if (rota === '/upload' && (metodo === 'POST' || metodo === 'PUT')) {
-
     if (!ZONE || !PASS || !HOST || !SEGREDO) {
       return responder(res, 500, { erro: 'Configuracao incompleta.' });
     }
@@ -261,7 +345,6 @@ const servidor = http.createServer(function (req, res) {
 
     const expira = Number(partes[0]);
     const tamanho = Number(partes[1]);
-
     if (!expira || !tamanho) return responder(res, 403, { erro: 'Token mal formado.' });
     if (Math.floor(Date.now() / 1000) > expira) return responder(res, 403, { erro: 'Token expirado.' });
     if (!iguais(partes[2], assinar(caminho + '|' + expira + '|' + tamanho))) {
@@ -279,11 +362,8 @@ const servidor = http.createServer(function (req, res) {
       method: 'PUT',
       headers: { 'AccessKey': PASS, 'Content-Type': tipo }
     };
-    if (req.headers['content-length']) {
-      opcoes.headers['Content-Length'] = req.headers['content-length'];
-    } else {
-      opcoes.headers['Transfer-Encoding'] = 'chunked';
-    }
+    if (req.headers['content-length']) opcoes.headers['Content-Length'] = req.headers['content-length'];
+    else opcoes.headers['Transfer-Encoding'] = 'chunked';
 
     const pedido = https.request(opcoes, function (bunny) {
       let corpo = '';
@@ -295,7 +375,6 @@ const servidor = http.createServer(function (req, res) {
         responder(res, 200, { ok: true, caminho: caminho });
       });
     });
-
     pedido.on('error', function (e) {
       responder(res, 502, { erro: 'Falha ao contactar o Bunny.', detalhe: String(e.message) });
     });
@@ -304,7 +383,7 @@ const servidor = http.createServer(function (req, res) {
     return;
   }
 
-  /* ---------- 3. registar na base de dados ---------- */
+  /* ---------- registar ---------- */
   if (rota === '/create' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -312,10 +391,7 @@ const servidor = http.createServer(function (req, res) {
       const dono = String(p.owner || '').trim();
       const caminho = limpar(p.path);
       const tamanho = parseInt(String(p.size || '0').replace(/[^0-9]/g, ''), 10);
-
-      if (!dono || !caminho || !tamanho) {
-        return responder(res, 400, { erro: 'Dados em falta.' });
-      }
+      if (!dono || !caminho || !tamanho) return responder(res, 400, { erro: 'Dados em falta.' });
 
       carregarUtilizador(dono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
@@ -343,27 +419,20 @@ const servidor = http.createServer(function (req, res) {
 
         bubble('POST', '/stored file', registo, function (e3, j) {
           if (e3) return responder(res, 502, { erro: e3.message });
-
           bubble('PATCH', '/user/' + encodeURIComponent(u.id), {
             'Storage Used Bytes': u.usado + tamanho
           }, function () {
-            responder(res, 200, {
-              ok: true,
-              id: j.id || '',
-              usado: u.usado + tamanho,
-              limite: u.limite
-            });
+            responder(res, 200, { ok: true, id: j.id || '', usado: u.usado + tamanho, limite: u.limite });
           });
         });
       });
     });
   }
 
-  /* ---------- 4. listar ---------- */
+  /* ---------- listar ---------- */
   if (rota === '/files' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
-
       const dono = String(p.owner || '').trim();
       if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
 
@@ -371,50 +440,42 @@ const servidor = http.createServer(function (req, res) {
         if (e2) return responder(res, 403, { erro: e2.message });
 
         const lixo = p.trash === true;
+        const porTipo = !lixo && p.type;
+        const soPartilhados = !lixo && p.shared === true;
+        const recentes = !lixo && p.recent === true;
+        const global = porTipo || soPartilhados || recentes;
+
         const cf = [
           { key: 'Owner', constraint_type: 'equals', value: u.id },
           { key: 'Is Deleted', constraint_type: 'equals', value: lixo }
         ];
+        if (porTipo) cf.push({ key: 'File Type', constraint_type: 'equals', value: String(p.type) });
+        if (soPartilhados) cf.push({ key: 'Is Shared', constraint_type: 'equals', value: true });
 
-        if (!lixo) {
+        if (!global && !lixo) {
           if (p.folder_id) cf.push({ key: 'Folder', constraint_type: 'equals', value: String(p.folder_id) });
           else cf.push({ key: 'Folder', constraint_type: 'is_empty' });
-          if (p.type) cf.push({ key: 'File Type', constraint_type: 'equals', value: String(p.type) });
         }
 
-        const cp = [
-          { key: 'Owner', constraint_type: 'equals', value: u.id },
-          { key: 'Is Deleted', constraint_type: 'equals', value: false }
-        ];
-        if (!lixo) {
-          if (p.folder_id) cp.push({ key: 'Parent Folder', constraint_type: 'equals', value: String(p.folder_id) });
-          else cp.push({ key: 'Parent Folder', constraint_type: 'is_empty' });
-        }
+        const ordem = '&sort_field=Created Date&descending=true';
 
-        bubble('GET', '/stored file' + constraints(cf) + '&limit=100&sort_field=Created Date&descending=true', null, function (e3, jf) {
+        bubble('GET', '/stored file' + constraints(cf) + '&limit=100' + ordem, null, function (e3, jf) {
           if (e3) return responder(res, 502, { erro: e3.message });
+          const ficheiros = (((jf || {}).response || {}).results || []).map(mapear);
 
-          const ficheiros = (((jf || {}).response || {}).results || []).map(function (f) {
-            return {
-              id: f._id,
-              nome: f['Original Name'] || f['Name'] || '',
-              ext: f['Extension'] || '',
-              tipo: f['File Type'] || 'Other',
-              mime: f['MIME Type'] || '',
-              tamanho: Number(f['Size Bytes'] || 0),
-              caminho: f['Bunny Path'] || '',
-              url: urlAssinado(f['Bunny Path'] || '', 3600),
-              partilhado: f['Is Shared'] === true,
-              criado: f['Created Date'] || ''
-            };
-          });
-
-          if (lixo) {
+          if (global || lixo) {
             return responder(res, 200, {
               ok: true, pastas: [], ficheiros: ficheiros,
               usado: u.usado, limite: u.limite
             });
           }
+
+          const cp = [
+            { key: 'Owner', constraint_type: 'equals', value: u.id },
+            { key: 'Is Deleted', constraint_type: 'equals', value: false }
+          ];
+          if (p.folder_id) cp.push({ key: 'Parent Folder', constraint_type: 'equals', value: String(p.folder_id) });
+          else cp.push({ key: 'Parent Folder', constraint_type: 'is_empty' });
 
           bubble('GET', '/folder' + constraints(cp) + '&limit=100&sort_field=Name', null, function (e4, jp) {
             const pastas = e4 ? [] : (((jp || {}).response || {}).results || []).map(function (d) {
@@ -430,7 +491,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 5. apagar (para a lixeira) ---------- */
+  /* ---------- apagar ---------- */
   if (rota === '/delete' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -441,6 +502,22 @@ const servidor = http.createServer(function (req, res) {
       carregarUtilizador(dono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
 
+        if (p.folder === true) {
+          return bubble('GET', '/folder/' + encodeURIComponent(id), null, function (e3, jp) {
+            if (e3) return responder(res, 404, { erro: 'Pasta nao encontrada.' });
+            const d = (jp && jp.response) || jp;
+            if (String(d['Owner']) !== String(u.id)) {
+              return responder(res, 403, { erro: 'Esta pasta nao e tua.' });
+            }
+            bubble('PATCH', '/folder/' + encodeURIComponent(id), {
+              'Is Deleted': true, 'Deleted Date': new Date().toISOString()
+            }, function (e4) {
+              if (e4) return responder(res, 502, { erro: e4.message });
+              responder(res, 200, { ok: true });
+            });
+          });
+        }
+
         bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
           if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
           const f = (jf && jf.response) || jf;
@@ -448,12 +525,9 @@ const servidor = http.createServer(function (req, res) {
             return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
           }
 
-          const definitivo = p.permanent === true;
-
-          if (!definitivo) {
+          if (p.permanent !== true) {
             return bubble('PATCH', '/stored file/' + encodeURIComponent(id), {
-              'Is Deleted': true,
-              'Deleted Date': new Date().toISOString()
+              'Is Deleted': true, 'Deleted Date': new Date().toISOString()
             }, function (e4) {
               if (e4) return responder(res, 502, { erro: e4.message });
               responder(res, 200, { ok: true, lixeira: true });
@@ -474,7 +548,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 6. restaurar ---------- */
+  /* ---------- restaurar ---------- */
   if (rota === '/restore' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -484,13 +558,12 @@ const servidor = http.createServer(function (req, res) {
 
       carregarUtilizador(dono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
-        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
-          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
-          const f = (jf && jf.response) || jf;
-          if (String(f['Owner']) !== String(u.id)) {
-            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
-          }
-          bubble('PATCH', '/stored file/' + encodeURIComponent(id), { 'Is Deleted': false }, function (e4) {
+        const tipo = p.folder === true ? '/folder/' : '/stored file/';
+        bubble('GET', tipo + encodeURIComponent(id), null, function (e3, j) {
+          if (e3) return responder(res, 404, { erro: 'Nao encontrado.' });
+          const d = (j && j.response) || j;
+          if (String(d['Owner']) !== String(u.id)) return responder(res, 403, { erro: 'Nao e teu.' });
+          bubble('PATCH', tipo + encodeURIComponent(id), { 'Is Deleted': false }, function (e4) {
             if (e4) return responder(res, 502, { erro: e4.message });
             responder(res, 200, { ok: true });
           });
@@ -499,7 +572,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 7. renomear ---------- */
+  /* ---------- renomear ---------- */
   if (rota === '/rename' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -515,9 +588,7 @@ const servidor = http.createServer(function (req, res) {
         bubble('GET', tipo + encodeURIComponent(id), null, function (e3, j) {
           if (e3) return responder(res, 404, { erro: 'Nao encontrado.' });
           const d = (j && j.response) || j;
-          if (String(d['Owner']) !== String(u.id)) {
-            return responder(res, 403, { erro: 'Nao e teu.' });
-          }
+          if (String(d['Owner']) !== String(u.id)) return responder(res, 403, { erro: 'Nao e teu.' });
           const campo = ePasta ? { 'Name': nome } : { 'Original Name': nome };
           bubble('PATCH', tipo + encodeURIComponent(id), campo, function (e4) {
             if (e4) return responder(res, 502, { erro: e4.message });
@@ -528,7 +599,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 8. mover ---------- */
+  /* ---------- mover ---------- */
   if (rota === '/move' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -544,8 +615,9 @@ const servidor = http.createServer(function (req, res) {
           if (String(f['Owner']) !== String(u.id)) {
             return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
           }
-          const alvo = p.folder_id ? String(p.folder_id) : null;
-          bubble('PATCH', '/stored file/' + encodeURIComponent(id), { 'Folder': alvo }, function (e4) {
+          bubble('PATCH', '/stored file/' + encodeURIComponent(id), {
+            'Folder': p.folder_id ? String(p.folder_id) : null
+          }, function (e4) {
             if (e4) return responder(res, 502, { erro: e4.message });
             responder(res, 200, { ok: true });
           });
@@ -554,7 +626,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 9. criar pasta ---------- */
+  /* ---------- criar pasta ---------- */
   if (rota === '/folder' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -588,7 +660,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 10. partilhar ---------- */
+  /* ---------- partilhar ---------- */
   if (rota === '/share' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -613,12 +685,10 @@ const servidor = http.createServer(function (req, res) {
 
           const chave = crypto.randomBytes(16).toString('hex');
           const dias = Math.min(365, Math.max(1, parseInt(p.days || '7', 10)));
-          const ate = new Date(Date.now() + dias * 86400000).toISOString();
-
           const mudanca = {
             'Is Shared': true,
             'Share Token': chave,
-            'Share Expires': ate,
+            'Share Expires': new Date(Date.now() + dias * 86400000).toISOString(),
             'Share Downloads': 0
           };
           if (p.max_downloads) mudanca['Share Max Downloads'] = parseInt(p.max_downloads, 10) || 0;
@@ -626,14 +696,14 @@ const servidor = http.createServer(function (req, res) {
 
           bubble('PATCH', '/stored file/' + encodeURIComponent(id), mudanca, function (e4) {
             if (e4) return responder(res, 502, { erro: e4.message });
-            responder(res, 200, { ok: true, token: chave, expira: ate });
+            responder(res, 200, { ok: true, token: chave, expira: mudanca['Share Expires'] });
           });
         });
       });
     });
   }
 
-  /* ---------- 11. abrir partilha ---------- */
+  /* ---------- abrir partilha ---------- */
   if (rota === '/shared' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -658,7 +728,7 @@ const servidor = http.createServer(function (req, res) {
         const max = Number(f['Share Max Downloads'] || 0);
         const feitos = Number(f['Share Downloads'] || 0);
         if (max > 0 && feitos >= max) {
-          return responder(res, 410, { erro: 'Limite de downloads atingido.' });
+          return responder(res, 410, { erro: 'Limite de acessos atingido.' });
         }
         if (f['Share Password'] && String(p.password || '') !== f['Share Password']) {
           return responder(res, 401, { erro: 'Password incorreta.', precisa_password: true });
@@ -680,7 +750,7 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- 12. link assinado ---------- */
+  /* ---------- link assinado ---------- */
   if (rota === '/link' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
