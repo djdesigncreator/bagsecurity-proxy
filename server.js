@@ -71,7 +71,7 @@ function lerJson(req, cb) {
   req.on('error', function (e) { cb(e); });
 }
 
-/* ============ JWT para o OnlyOffice ============ */
+/* ============ JWT do OnlyOffice ============ */
 
 function b64url(buf) {
   return Buffer.from(buf).toString('base64')
@@ -193,25 +193,58 @@ function assinaturaTus(videoId, expira) {
     .update(STREAM_LIB + STREAM_KEY + expira + videoId).digest('hex');
 }
 
-/* ============ utilizador ============ */
+/* ============ utilizador e subscrição ============ */
+
+function diasAte(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  return Math.ceil((d.getTime() - Date.now()) / 86400000);
+}
 
 function carregarUtilizador(id, cb) {
   bubble('GET', '/user/' + encodeURIComponent(id), null, function (e, j) {
     if (e) return cb(e);
     const d = (j && j.response) || j;
     if (!d || !d._id) return cb(new Error('Utilizador nao encontrado.'));
+
+    const expiraEm = d['Plan Expires'] || '';
+    const dias = diasAte(expiraEm);
+    const base = Number(d['Storage Limit Bytes'] || 0);
+    const extra = Number(d['Extra Storage Bytes'] || 0);
+    const limite = base + extra;
+    const usado = Number(d['Storage Used Bytes'] || 0);
+
     cb(null, {
       id: d._id,
       nome: d['Full Name'] || 'Utilizador',
-      limite: Number(d['Storage Limit Bytes'] || 0),
-      usado: Number(d['Storage Used Bytes'] || 0),
+      base: base,
+      extra: extra,
+      limite: limite,
+      usado: usado,
       maxFicheiro: Number(d['Max File Size Bytes'] || 0),
-      plano: d['Plan'] || ''
+      plano: d['Plan'] || '',
+      activo: d['Is Active'] !== false,
+      expira: expiraEm,
+      dias: dias,
+      expirado: dias !== null && dias <= 0,
+      excesso: limite > 0 && usado > limite
     });
   });
 }
 
-/* ============ URL assinado ============ */
+/* devolve a razão do bloqueio, ou null se pode enviar */
+function porqueBloqueado(u) {
+  if (!u.activo) return 'A tua conta esta suspensa. Fala connosco.';
+  if (!u.expira) return 'A tua subscricao nao esta activa. Escolhe um plano para comecares.';
+  if (u.expirado) {
+    return 'O teu plano expirou. Renova para voltares a enviar ficheiros. '
+      + 'Os teus ficheiros continuam acessiveis.';
+  }
+  return null;
+}
+
+/* ============ URL assinado do CDN ============ */
 
 function urlAssinado(caminho, segundos) {
   if (!CDN) return '';
@@ -241,23 +274,18 @@ function apagarNoBunny(caminho, cb) {
   p.end();
 }
 
-/* guarda um ficheiro no Storage a partir de um URL */
+/* guarda no Storage um ficheiro vindo de um URL */
 function guardarDeUrl(origem, caminho, tipo, cb) {
   let u;
   try { u = new URL(origem); } catch (e) { return cb(new Error('URL de origem invalido.')); }
 
   const leitura = https.get({
-    hostname: u.hostname, path: u.pathname + u.search,
-    headers: { 'accept': '*/*' }
+    hostname: u.hostname, path: u.pathname + u.search, headers: { 'accept': '*/*' }
   }, function (r) {
-    if (r.statusCode !== 200) {
-      r.resume();
-      return cb(new Error('Origem respondeu ' + r.statusCode));
-    }
+    if (r.statusCode !== 200) { r.resume(); return cb(new Error('Origem respondeu ' + r.statusCode)); }
 
     const escrita = https.request({
-      hostname: HOST, path: '/' + ZONE + '/' + encodeURI(caminho),
-      method: 'PUT',
+      hostname: HOST, path: '/' + ZONE + '/' + encodeURI(caminho), method: 'PUT',
       headers: {
         'AccessKey': PASS,
         'Content-Type': tipo || 'application/octet-stream',
@@ -282,7 +310,7 @@ function guardarDeUrl(origem, caminho, tipo, cb) {
   leitura.on('error', function (e) { cb(e); });
 }
 
-/* ============ classificar ============ */
+/* ============ classificar por extensão ============ */
 
 const TIPOS = {
   Video: ['mp4','mov','webm','avi','mkv','m4v','mpg','mpeg','wmv','flv','3gp','ts'],
@@ -307,7 +335,7 @@ function eVideo(ext) {
   return TIPOS.Video.indexOf(String(ext || '').toLowerCase()) !== -1;
 }
 
-/* ============ OnlyOffice: que documentos abre ============ */
+/* ============ OnlyOffice: formatos ============ */
 
 const OO_TEXTO = ['docx','doc','odt','rtf','txt','html','epub','fb2','pdf','djvu','xps','md'];
 const OO_FOLHA = ['xlsx','xls','ods','csv'];
@@ -326,7 +354,7 @@ function ooEditavel(ext) {
   return OO_EDITAVEL.indexOf(String(ext || '').toLowerCase()) !== -1;
 }
 
-/* ============ mapear ============ */
+/* ============ mapear ficheiro para a aplicação ============ */
 
 function mapear(f) {
   const noStream = f['Storage Type'] === 'Bunny Stream';
@@ -375,7 +403,7 @@ const servidor = http.createServer(function (req, res) {
   if (rota === '/' || rota === '') {
     return responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-6',
+      versao: 'container-7',
       storage: Boolean(ZONE && PASS && HOST),
       bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
       cdn_assinado: Boolean(CDN_KEY),
@@ -387,9 +415,10 @@ const servidor = http.createServer(function (req, res) {
   /* ---------- planos ---------- */
   if (rota === '/plans' && metodo === 'POST') {
     const c = [{ key: 'Is Active', constraint_type: 'equals', value: true }];
+
     return bubble('GET', '/plan' + constraints(c) + '&limit=50&sort_field=Sort Order', null, function (e, j) {
       if (e) return responder(res, 502, { erro: e.message });
-      const lista = (((j || {}).response || {}).results || []).map(function (p) {
+      const planos = (((j || {}).response || {}).results || []).map(function (p) {
         return {
           id: p._id, nome: p['Name'] || '', label: p['Storage Label'] || '',
           limite: Number(p['Storage Limit Bytes'] || 0),
@@ -400,7 +429,98 @@ const servidor = http.createServer(function (req, res) {
           ordem: Number(p['Sort Order'] || 0)
         };
       });
-      responder(res, 200, { ok: true, planos: lista });
+
+      bubble('GET', '/storage pack' + constraints(c) + '&limit=50&sort_field=Sort Order', null, function (e2, j2) {
+        const packs = e2 ? [] : (((j2 || {}).response || {}).results || []).map(function (p) {
+          return {
+            id: p._id, nome: p['Name'] || '', label: p['Label'] || '',
+            bytes: Number(p['Bytes'] || 0),
+            preco: Number(p['Price MZN'] || 0),
+            precoAno: Number(p['Price Year MZN'] || 0),
+            ordem: Number(p['Sort Order'] || 0)
+          };
+        });
+        responder(res, 200, { ok: true, planos: planos, packs: packs });
+      });
+    });
+  }
+
+  /* ---------- conta: estado da subscrição ---------- */
+  if (rota === '/account' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        responder(res, 200, {
+          ok: true,
+          nome: u.nome,
+          usado: u.usado,
+          base: u.base,
+          extra: u.extra,
+          limite: u.limite,
+          expira: u.expira,
+          dias: u.dias,
+          expirado: u.expirado,
+          excesso: u.excesso,
+          bloqueio: porqueBloqueado(u)
+        });
+      });
+    });
+  }
+
+  /* ---------- simular mudança de plano ---------- */
+  if (rota === '/plan-check' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const planoId = String(p.plan_id || '').trim();
+      if (!dono || !planoId) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        bubble('GET', '/plan/' + encodeURIComponent(planoId), null, function (e3, jp) {
+          if (e3) return responder(res, 404, { erro: 'Plano nao encontrado.' });
+          const pl = (jp && jp.response) || jp;
+          const novoBase = Number(pl['Storage Limit Bytes'] || 0);
+          const falta = Math.max(0, u.usado - novoBase);
+
+          if (!falta) {
+            return responder(res, 200, {
+              ok: true, cabe: true, falta: 0,
+              plano: pl['Name'] || '', label: pl['Storage Label'] || '',
+              preco: Number(pl['Price MZN'] || 0),
+              sugestao: null, packs: []
+            });
+          }
+
+          const c = [{ key: 'Is Active', constraint_type: 'equals', value: true }];
+          bubble('GET', '/storage pack' + constraints(c) + '&limit=50&sort_field=Sort Order', null, function (e4, j4) {
+            const packs = e4 ? [] : (((j4 || {}).response || {}).results || []).map(function (x) {
+              return {
+                id: x._id, nome: x['Name'] || '', label: x['Label'] || '',
+                bytes: Number(x['Bytes'] || 0),
+                preco: Number(x['Price MZN'] || 0),
+                precoAno: Number(x['Price Year MZN'] || 0),
+                chega: Number(x['Bytes'] || 0) >= falta
+              };
+            });
+
+            const suficientes = packs.filter(function (x) { return x.chega; });
+            const sugestao = suficientes.length ? suficientes[0] : null;
+
+            responder(res, 200, {
+              ok: true, cabe: false, falta: falta,
+              plano: pl['Name'] || '', label: pl['Storage Label'] || '',
+              preco: Number(pl['Price MZN'] || 0),
+              sugestao: sugestao, packs: packs
+            });
+          });
+        });
+      });
     });
   }
 
@@ -433,7 +553,9 @@ const servidor = http.createServer(function (req, res) {
             ok: true, total: todos.length, contagem: contagem, bytes: bytes,
             partilhados: todos.filter(function (f) { return f['Is Shared'] === true; }).length,
             recentes: todos.slice(0, 8).map(mapear),
-            usado: u.usado, limite: u.limite
+            usado: u.usado, limite: u.limite, base: u.base, extra: u.extra,
+            dias: u.dias, expirado: u.expirado, excesso: u.excesso,
+            bloqueio: porqueBloqueado(u)
           });
         });
       });
@@ -442,7 +564,6 @@ const servidor = http.createServer(function (req, res) {
 
   /* ================= ONLYOFFICE ================= */
 
-  /* ---------- configuração do editor ---------- */
   if (rota === '/office' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -467,31 +588,26 @@ const servidor = http.createServer(function (req, res) {
           if (!tipoDoc) return responder(res, 400, { erro: 'Este formato nao abre no editor.' });
 
           const caminho = f['Bunny Path'] || '';
-          const podeEditar = p.edit === true && ooEditavel(ext);
+          /* editar exige subscricao valida */
+          const bloqueio = porqueBloqueado(u);
+          const podeEditar = p.edit === true && ooEditavel(ext) && !bloqueio;
 
-          /* chave única por versão do ficheiro */
           const chave = crypto.createHash('md5')
             .update(id + '|' + (f['Modified Date'] || f['Created Date'] || ''))
             .digest('hex').substring(0, 20);
 
-          /* token que o callback vai apresentar */
           const expiraCb = Math.floor(Date.now() / 1000) + 86400;
           const tokenCb = expiraCb + '.' + assinar(id + '|' + caminho + '|' + expiraCb);
-
           const base = SELF_URL || ('https://' + (req.headers.host || ''));
 
           const config = {
             document: {
-              fileType: ext,
-              key: chave,
+              fileType: ext, key: chave,
               title: f['Original Name'] || f['Name'] || 'documento',
               url: urlAssinado(caminho, 86400),
               permissions: {
-                edit: podeEditar,
-                download: true,
-                print: true,
-                comment: podeEditar,
-                fillForms: podeEditar
+                edit: podeEditar, download: true, print: true,
+                comment: podeEditar, fillForms: podeEditar
               }
             },
             documentType: tipoDoc,
@@ -500,36 +616,27 @@ const servidor = http.createServer(function (req, res) {
               mode: podeEditar ? 'edit' : 'view',
               lang: 'pt',
               user: { id: u.id, name: u.nome },
-              customization: {
-                autosave: true,
-                forcesave: true,
-                compactHeader: false,
-                logo: { image: '', url: '' }
-              }
+              customization: { autosave: true, forcesave: true, compactHeader: false }
             }
           };
 
           if (podeEditar) {
             config.editorConfig.callbackUrl = base + '/office-save'
-              + '?id=' + encodeURIComponent(id)
-              + '&t=' + encodeURIComponent(tokenCb);
+              + '?id=' + encodeURIComponent(id) + '&t=' + encodeURIComponent(tokenCb);
           }
 
           config.token = jwtAssinar(config);
 
           responder(res, 200, {
-            ok: true,
-            server: OO_URL,
-            config: config,
-            editar: podeEditar,
-            nome: f['Original Name'] || f['Name'] || ''
+            ok: true, server: OO_URL, config: config, editar: podeEditar,
+            nome: f['Original Name'] || f['Name'] || '',
+            bloqueio: (p.edit === true && bloqueio) ? bloqueio : null
           });
         });
       });
     });
   }
 
-  /* ---------- o OnlyOffice devolve o ficheiro editado ---------- */
   if (rota === '/office-save' && metodo === 'POST') {
     const id = url.searchParams.get('id') || '';
     const t = url.searchParams.get('t') || '';
@@ -542,7 +649,6 @@ const servidor = http.createServer(function (req, res) {
         res.end(JSON.stringify({ error: codigo }));
       }
 
-      /* estado 2 = pronto a guardar; 6 = guardar forçado */
       const estado = Number(corpo.status || 0);
       if (estado !== 2 && estado !== 6) return fim(0);
 
@@ -551,7 +657,6 @@ const servidor = http.createServer(function (req, res) {
       const expira = Number(partes[0]);
       if (!expira || Math.floor(Date.now() / 1000) > expira) return fim(1);
 
-      /* o corpo vem assinado pelo OnlyOffice */
       const jwtToken = corpo.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
       if (OO_SECRET && jwtToken && !jwtVerificar(jwtToken)) return fim(1);
 
@@ -560,7 +665,6 @@ const servidor = http.createServer(function (req, res) {
         const f = (jf && jf.response) || jf;
         const caminho = f['Bunny Path'] || '';
         if (!caminho) return fim(1);
-
         if (!iguais(partes[1], assinar(id + '|' + caminho + '|' + expira))) return fim(1);
 
         const origem = corpo.url;
@@ -568,15 +672,12 @@ const servidor = http.createServer(function (req, res) {
 
         guardarDeUrl(origem, caminho, f['MIME Type'] || '', function (e3) {
           if (e3) return fim(1);
-          bubble('PATCH', '/stored file/' + encodeURIComponent(id), {
-            'Status': 'Ready'
-          }, function () { fim(0); });
+          bubble('PATCH', '/stored file/' + encodeURIComponent(id), { 'Status': 'Ready' }, function () { fim(0); });
         });
       });
     });
   }
 
-  /* ---------- criar documento novo ---------- */
   if (rota === '/office-new' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -591,9 +692,15 @@ const servidor = http.createServer(function (req, res) {
       carregarUtilizador(dono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
 
-        const modelo = OO_URL + '/web-apps/apps/' +
-          (tipo === 'docx' ? 'documenteditor' : (tipo === 'xlsx' ? 'spreadsheeteditor' : 'presentationeditor')) +
-          '/main/resources/help/pt/new.' + tipo;
+        const bloqueio = porqueBloqueado(u);
+        if (bloqueio) return responder(res, 403, { erro: bloqueio, bloqueado: true });
+        if (u.limite > 0 && u.usado >= u.limite) {
+          return responder(res, 403, { erro: 'Sem espaco disponivel.', excesso: true });
+        }
+
+        const modelo = OO_URL + '/web-apps/apps/'
+          + (tipo === 'docx' ? 'documenteditor' : (tipo === 'xlsx' ? 'spreadsheeteditor' : 'presentationeditor'))
+          + '/main/resources/help/pt/new.' + tipo;
 
         const nomeFicheiro = nome.replace(/\.(docx|xlsx|pptx)$/i, '') + '.' + tipo;
         const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + limpar(nomeFicheiro);
@@ -603,23 +710,17 @@ const servidor = http.createServer(function (req, res) {
           if (e3) return responder(res, 502, { erro: 'Nao foi possivel criar: ' + e3.message });
 
           const registo = {
-            'Owner': u.id,
-            'Name': unico,
-            'Original Name': nomeFicheiro,
-            'Extension': tipo,
+            'Owner': u.id, 'Name': unico, 'Original Name': nomeFicheiro, 'Extension': tipo,
             'MIME Type': tipo === 'docx'
               ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
               : (tipo === 'xlsx'
                 ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 : 'application/vnd.openxmlformats-officedocument.presentationml.presentation'),
             'File Type': classificar(tipo),
-            'Storage Type': 'Bunny Storage',
-            'Status': 'Ready',
-            'Size Bytes': 12000,
-            'Bunny Path': caminho,
+            'Storage Type': 'Bunny Storage', 'Status': 'Ready',
+            'Size Bytes': 12000, 'Bunny Path': caminho,
             'CDN URL': CDN ? 'https://' + CDN + '/' + encodeURI(caminho) : '',
-            'Is Deleted': false,
-            'Is Shared': false
+            'Is Deleted': false, 'Is Shared': false
           };
           if (p.folder_id) registo['Folder'] = String(p.folder_id);
 
@@ -653,11 +754,21 @@ const servidor = http.createServer(function (req, res) {
 
       carregarUtilizador(pedidoDono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
+
+        /* --- subscricao --- */
+        const bloqueio = porqueBloqueado(u);
+        if (bloqueio) return responder(res, 403, { erro: bloqueio, bloqueado: true });
+
+        /* --- limites --- */
         if (u.maxFicheiro > 0 && tamanho > u.maxFicheiro) {
           return responder(res, 403, { erro: 'Ficheiro acima do limite do plano.' });
         }
-        if (u.limite > 0 && tamanho > (u.limite - u.usado)) {
-          return responder(res, 403, { erro: 'Sem espaco suficiente.' });
+        const livre = u.limite - u.usado;
+        if (u.limite > 0 && tamanho > livre) {
+          return responder(res, 403, {
+            erro: 'Sem espaco suficiente. Faltam ' + Math.max(0, tamanho - livre) + ' bytes.',
+            excesso: true, falta: Math.max(0, tamanho - livre)
+          });
         }
 
         if (video) {
@@ -770,8 +881,7 @@ const servidor = http.createServer(function (req, res) {
           'Status': modoStream ? 'Processing' : 'Ready',
           'Size Bytes': tamanho,
           'Bunny Path': caminho,
-          'Is Deleted': false,
-          'Is Shared': false
+          'Is Deleted': false, 'Is Shared': false
         };
 
         if (modoStream) {
@@ -825,7 +935,6 @@ const servidor = http.createServer(function (req, res) {
             if (novo !== f['Status']) {
               bubble('PATCH', '/stored file/' + encodeURIComponent(id), { 'Status': novo }, function () {});
             }
-
             responder(res, 200, {
               ok: true, estado: novo, progresso: Number(v.encodeProgress || 0),
               duracao: Number(v.length || 0)
@@ -865,15 +974,21 @@ const servidor = http.createServer(function (req, res) {
           else cf.push({ key: 'Folder', constraint_type: 'is_empty' });
         }
 
+        const estadoConta = {
+          usado: u.usado, limite: u.limite, base: u.base, extra: u.extra,
+          dias: u.dias, expirado: u.expirado, excesso: u.excesso,
+          bloqueio: porqueBloqueado(u)
+        };
+
         bubble('GET', '/stored file' + constraints(cf) + '&limit=100&sort_field=Created Date&descending=true',
           null, function (e3, jf) {
           if (e3) return responder(res, 502, { erro: e3.message });
           const ficheiros = (((jf || {}).response || {}).results || []).map(mapear);
 
           if (global || lixo) {
-            return responder(res, 200, {
-              ok: true, pastas: [], ficheiros: ficheiros, usado: u.usado, limite: u.limite
-            });
+            return responder(res, 200, Object.assign({
+              ok: true, pastas: [], ficheiros: ficheiros
+            }, estadoConta));
           }
 
           const cp = [
@@ -887,9 +1002,9 @@ const servidor = http.createServer(function (req, res) {
             const pastas = e4 ? [] : (((jp || {}).response || {}).results || []).map(function (d) {
               return { id: d._id, nome: d['Name'] || '', caminho: d['Path'] || '' };
             });
-            responder(res, 200, {
-              ok: true, pastas: pastas, ficheiros: ficheiros, usado: u.usado, limite: u.limite
-            });
+            responder(res, 200, Object.assign({
+              ok: true, pastas: pastas, ficheiros: ficheiros
+            }, estadoConta));
           });
         });
       });
@@ -943,7 +1058,7 @@ const servidor = http.createServer(function (req, res) {
               if (e5) return responder(res, 502, { erro: e5.message });
               const novo = Math.max(0, u.usado - Number(f['Size Bytes'] || 0));
               bubble('PATCH', '/user/' + encodeURIComponent(u.id), { 'Storage Used Bytes': novo }, function () {
-                responder(res, 200, { ok: true, definitivo: true, usado: novo });
+                responder(res, 200, { ok: true, definitivo: true, usado: novo, limite: u.limite });
               });
             });
           }
