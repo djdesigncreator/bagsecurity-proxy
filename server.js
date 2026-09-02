@@ -15,6 +15,10 @@ const STREAM_LIB = String(process.env.STREAM_LIBRARY || '').trim();
 const STREAM_KEY = String(process.env.STREAM_KEY || '').trim();
 const STREAM_CDN = (process.env.STREAM_CDN || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
 
+const OO_URL = (process.env.ONLYOFFICE_URL || '').replace(/\/+$/, '');
+const OO_SECRET = String(process.env.ONLYOFFICE_SECRET || '').trim();
+const SELF_URL = (process.env.SELF_URL || '').replace(/\/+$/, '');
+
 const PORTA = process.env.PORT || 8080;
 
 const CORS = {
@@ -65,6 +69,32 @@ function lerJson(req, cb) {
     catch (e) { cb(e); }
   });
   req.on('error', function (e) { cb(e); });
+}
+
+/* ============ JWT para o OnlyOffice ============ */
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64')
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function jwtAssinar(payload) {
+  const cabecalho = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const corpo = b64url(JSON.stringify(payload));
+  const base = cabecalho + '.' + corpo;
+  const firma = b64url(crypto.createHmac('sha256', OO_SECRET).update(base).digest());
+  return base + '.' + firma;
+}
+
+function jwtVerificar(token) {
+  const partes = String(token || '').split('.');
+  if (partes.length !== 3) return null;
+  const base = partes[0] + '.' + partes[1];
+  const esperada = b64url(crypto.createHmac('sha256', OO_SECRET).update(base).digest());
+  if (!iguais(partes[2], esperada)) return null;
+  try {
+    return JSON.parse(Buffer.from(partes[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString());
+  } catch (e) { return null; }
 }
 
 /* ============ Data API do Bubble ============ */
@@ -126,7 +156,7 @@ function buscarTudo(tipo, cs, extra, cb) {
   pagina(0);
 }
 
-/* ============ API do Bunny Stream ============ */
+/* ============ Bunny Stream ============ */
 
 function stream(metodo, caminho, corpo, cb) {
   if (!STREAM_LIB || !STREAM_KEY) return cb(new Error('Stream nao configurado.'));
@@ -136,11 +166,7 @@ function stream(metodo, caminho, corpo, cb) {
     hostname: 'video.bunnycdn.com',
     path: '/library/' + STREAM_LIB + caminho,
     method: metodo,
-    headers: {
-      'AccessKey': STREAM_KEY,
-      'Content-Type': 'application/json',
-      'accept': 'application/json'
-    }
+    headers: { 'AccessKey': STREAM_KEY, 'Content-Type': 'application/json', 'accept': 'application/json' }
   };
   if (payload) opcoes.headers['Content-Length'] = Buffer.byteLength(payload);
 
@@ -152,8 +178,7 @@ function stream(metodo, caminho, corpo, cb) {
         return cb(new Error('Stream ' + r.statusCode + ': ' + texto.substring(0, 160)));
       }
       if (!texto) return cb(null, {});
-      try { cb(null, JSON.parse(texto)); }
-      catch (e) { cb(null, {}); }
+      try { cb(null, JSON.parse(texto)); } catch (e) { cb(null, {}); }
     });
   });
 
@@ -163,11 +188,9 @@ function stream(metodo, caminho, corpo, cb) {
   pedido.end();
 }
 
-/* assinatura TUS: sha256 de libraryId + apiKey + expira + videoId */
 function assinaturaTus(videoId, expira) {
   return crypto.createHash('sha256')
-    .update(STREAM_LIB + STREAM_KEY + expira + videoId)
-    .digest('hex');
+    .update(STREAM_LIB + STREAM_KEY + expira + videoId).digest('hex');
 }
 
 /* ============ utilizador ============ */
@@ -179,6 +202,7 @@ function carregarUtilizador(id, cb) {
     if (!d || !d._id) return cb(new Error('Utilizador nao encontrado.'));
     cb(null, {
       id: d._id,
+      nome: d['Full Name'] || 'Utilizador',
       limite: Number(d['Storage Limit Bytes'] || 0),
       usado: Number(d['Storage Used Bytes'] || 0),
       maxFicheiro: Number(d['Max File Size Bytes'] || 0),
@@ -187,7 +211,7 @@ function carregarUtilizador(id, cb) {
   });
 }
 
-/* ============ URL assinado do CDN ============ */
+/* ============ URL assinado ============ */
 
 function urlAssinado(caminho, segundos) {
   if (!CDN) return '';
@@ -201,15 +225,13 @@ function urlAssinado(caminho, segundos) {
   return 'https://' + CDN + limpo + '?token=' + hash + '&expires=' + expira;
 }
 
-/* ============ apagar no Bunny ============ */
+/* ============ Bunny Storage ============ */
 
 function apagarNoBunny(caminho, cb) {
   if (!caminho) return cb(null, 404);
   const p = https.request({
-    hostname: HOST,
-    path: '/' + ZONE + '/' + encodeURI(caminho),
-    method: 'DELETE',
-    headers: { 'AccessKey': PASS }
+    hostname: HOST, path: '/' + ZONE + '/' + encodeURI(caminho),
+    method: 'DELETE', headers: { 'AccessKey': PASS }
   }, function (r) {
     r.resume();
     r.on('end', function () { cb(null, r.statusCode); });
@@ -217,6 +239,47 @@ function apagarNoBunny(caminho, cb) {
   p.setTimeout(15000, function () { p.destroy(); });
   p.on('error', function (e) { cb(e); });
   p.end();
+}
+
+/* guarda um ficheiro no Storage a partir de um URL */
+function guardarDeUrl(origem, caminho, tipo, cb) {
+  let u;
+  try { u = new URL(origem); } catch (e) { return cb(new Error('URL de origem invalido.')); }
+
+  const leitura = https.get({
+    hostname: u.hostname, path: u.pathname + u.search,
+    headers: { 'accept': '*/*' }
+  }, function (r) {
+    if (r.statusCode !== 200) {
+      r.resume();
+      return cb(new Error('Origem respondeu ' + r.statusCode));
+    }
+
+    const escrita = https.request({
+      hostname: HOST, path: '/' + ZONE + '/' + encodeURI(caminho),
+      method: 'PUT',
+      headers: {
+        'AccessKey': PASS,
+        'Content-Type': tipo || 'application/octet-stream',
+        'Transfer-Encoding': 'chunked'
+      }
+    }, function (b) {
+      let corpo = '';
+      b.on('data', function (c) { corpo += c; });
+      b.on('end', function () {
+        if (b.statusCode !== 201 && b.statusCode !== 200) {
+          return cb(new Error('Bunny respondeu ' + b.statusCode));
+        }
+        cb(null, true);
+      });
+    });
+
+    escrita.on('error', function (e) { cb(e); });
+    r.pipe(escrita);
+  });
+
+  leitura.setTimeout(120000, function () { leitura.destroy(new Error('Demorou demasiado.')); });
+  leitura.on('error', function (e) { cb(e); });
 }
 
 /* ============ classificar ============ */
@@ -244,16 +307,36 @@ function eVideo(ext) {
   return TIPOS.Video.indexOf(String(ext || '').toLowerCase()) !== -1;
 }
 
-/* ============ mapear ficheiro ============ */
+/* ============ OnlyOffice: que documentos abre ============ */
+
+const OO_TEXTO = ['docx','doc','odt','rtf','txt','html','epub','fb2','pdf','djvu','xps','md'];
+const OO_FOLHA = ['xlsx','xls','ods','csv'];
+const OO_SLIDE = ['pptx','ppt','odp'];
+const OO_EDITAVEL = ['docx','odt','rtf','txt','xlsx','ods','csv','pptx','odp'];
+
+function ooTipo(ext) {
+  const e = String(ext || '').toLowerCase();
+  if (OO_TEXTO.indexOf(e) !== -1) return 'word';
+  if (OO_FOLHA.indexOf(e) !== -1) return 'cell';
+  if (OO_SLIDE.indexOf(e) !== -1) return 'slide';
+  return '';
+}
+
+function ooEditavel(ext) {
+  return OO_EDITAVEL.indexOf(String(ext || '').toLowerCase()) !== -1;
+}
+
+/* ============ mapear ============ */
 
 function mapear(f) {
   const noStream = f['Storage Type'] === 'Bunny Stream';
   const vid = f['Bunny Video ID'] || '';
+  const ext = f['Extension'] || '';
 
   return {
     id: f._id,
     nome: f['Original Name'] || f['Name'] || '',
-    ext: f['Extension'] || '',
+    ext: ext,
     tipo: f['File Type'] || 'Other',
     mime: f['MIME Type'] || '',
     tamanho: Number(f['Size Bytes'] || 0),
@@ -261,6 +344,8 @@ function mapear(f) {
     estado: f['Status'] || 'Ready',
     stream: noStream,
     video_id: vid,
+    office: Boolean(OO_URL) && !noStream && ooTipo(ext) !== '',
+    editavel: Boolean(OO_URL) && !noStream && ooEditavel(ext),
     url: noStream
       ? (STREAM_CDN && vid ? 'https://' + STREAM_CDN + '/' + vid + '/play_720p.mp4' : '')
       : urlAssinado(f['Bunny Path'] || '', 3600),
@@ -290,11 +375,12 @@ const servidor = http.createServer(function (req, res) {
   if (rota === '/' || rota === '') {
     return responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-5',
+      versao: 'container-6',
       storage: Boolean(ZONE && PASS && HOST),
       bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
       cdn_assinado: Boolean(CDN_KEY),
-      stream: Boolean(STREAM_LIB && STREAM_KEY && STREAM_CDN)
+      stream: Boolean(STREAM_LIB && STREAM_KEY && STREAM_CDN),
+      office: Boolean(OO_URL && OO_SECRET)
     });
   }
 
@@ -308,7 +394,6 @@ const servidor = http.createServer(function (req, res) {
           id: p._id, nome: p['Name'] || '', label: p['Storage Label'] || '',
           limite: Number(p['Storage Limit Bytes'] || 0),
           maxFicheiro: Number(p['Max File Size Bytes'] || 0),
-          maxVideo: Number(p['Max Video Size Bytes'] || 0),
           preco: Number(p['Price MZN'] || 0),
           utilizadores: Number(p['Max Users'] || 1),
           partilha: p['Allows Sharing'] === true,
@@ -345,10 +430,7 @@ const servidor = http.createServer(function (req, res) {
           });
 
           responder(res, 200, {
-            ok: true,
-            total: todos.length,
-            contagem: contagem,
-            bytes: bytes,
+            ok: true, total: todos.length, contagem: contagem, bytes: bytes,
             partilhados: todos.filter(function (f) { return f['Is Shared'] === true; }).length,
             recentes: todos.slice(0, 8).map(mapear),
             usado: u.usado, limite: u.limite
@@ -358,7 +440,200 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- token de upload (Storage ou Stream) ---------- */
+  /* ================= ONLYOFFICE ================= */
+
+  /* ---------- configuração do editor ---------- */
+  if (rota === '/office' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      if (!OO_URL || !OO_SECRET) return responder(res, 500, { erro: 'Editor nao configurado.' });
+
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e3, jf) {
+          if (e3) return responder(res, 404, { erro: 'Ficheiro nao encontrado.' });
+          const f = (jf && jf.response) || jf;
+          if (String(f['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Este ficheiro nao e teu.' });
+          }
+
+          const ext = String(f['Extension'] || '').toLowerCase();
+          const tipoDoc = ooTipo(ext);
+          if (!tipoDoc) return responder(res, 400, { erro: 'Este formato nao abre no editor.' });
+
+          const caminho = f['Bunny Path'] || '';
+          const podeEditar = p.edit === true && ooEditavel(ext);
+
+          /* chave única por versão do ficheiro */
+          const chave = crypto.createHash('md5')
+            .update(id + '|' + (f['Modified Date'] || f['Created Date'] || ''))
+            .digest('hex').substring(0, 20);
+
+          /* token que o callback vai apresentar */
+          const expiraCb = Math.floor(Date.now() / 1000) + 86400;
+          const tokenCb = expiraCb + '.' + assinar(id + '|' + caminho + '|' + expiraCb);
+
+          const base = SELF_URL || ('https://' + (req.headers.host || ''));
+
+          const config = {
+            document: {
+              fileType: ext,
+              key: chave,
+              title: f['Original Name'] || f['Name'] || 'documento',
+              url: urlAssinado(caminho, 86400),
+              permissions: {
+                edit: podeEditar,
+                download: true,
+                print: true,
+                comment: podeEditar,
+                fillForms: podeEditar
+              }
+            },
+            documentType: tipoDoc,
+            type: 'desktop',
+            editorConfig: {
+              mode: podeEditar ? 'edit' : 'view',
+              lang: 'pt',
+              user: { id: u.id, name: u.nome },
+              customization: {
+                autosave: true,
+                forcesave: true,
+                compactHeader: false,
+                logo: { image: '', url: '' }
+              }
+            }
+          };
+
+          if (podeEditar) {
+            config.editorConfig.callbackUrl = base + '/office-save'
+              + '?id=' + encodeURIComponent(id)
+              + '&t=' + encodeURIComponent(tokenCb);
+          }
+
+          config.token = jwtAssinar(config);
+
+          responder(res, 200, {
+            ok: true,
+            server: OO_URL,
+            config: config,
+            editar: podeEditar,
+            nome: f['Original Name'] || f['Name'] || ''
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- o OnlyOffice devolve o ficheiro editado ---------- */
+  if (rota === '/office-save' && metodo === 'POST') {
+    const id = url.searchParams.get('id') || '';
+    const t = url.searchParams.get('t') || '';
+
+    return lerJson(req, function (err, corpo) {
+      if (err) { res.writeHead(200, {'Content-Type':'application/json'}); return res.end('{"error":1}'); }
+
+      function fim(codigo) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: codigo }));
+      }
+
+      /* estado 2 = pronto a guardar; 6 = guardar forçado */
+      const estado = Number(corpo.status || 0);
+      if (estado !== 2 && estado !== 6) return fim(0);
+
+      const partes = String(t).split('.');
+      if (partes.length !== 2) return fim(1);
+      const expira = Number(partes[0]);
+      if (!expira || Math.floor(Date.now() / 1000) > expira) return fim(1);
+
+      /* o corpo vem assinado pelo OnlyOffice */
+      const jwtToken = corpo.token || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+      if (OO_SECRET && jwtToken && !jwtVerificar(jwtToken)) return fim(1);
+
+      bubble('GET', '/stored file/' + encodeURIComponent(id), null, function (e2, jf) {
+        if (e2) return fim(1);
+        const f = (jf && jf.response) || jf;
+        const caminho = f['Bunny Path'] || '';
+        if (!caminho) return fim(1);
+
+        if (!iguais(partes[1], assinar(id + '|' + caminho + '|' + expira))) return fim(1);
+
+        const origem = corpo.url;
+        if (!origem) return fim(1);
+
+        guardarDeUrl(origem, caminho, f['MIME Type'] || '', function (e3) {
+          if (e3) return fim(1);
+          bubble('PATCH', '/stored file/' + encodeURIComponent(id), {
+            'Status': 'Ready'
+          }, function () { fim(0); });
+        });
+      });
+    });
+  }
+
+  /* ---------- criar documento novo ---------- */
+  if (rota === '/office-new' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const tipo = String(p.tipo || 'docx').toLowerCase();
+      const nome = limparNome(p.name) || 'Documento sem titulo';
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+      if (['docx','xlsx','pptx'].indexOf(tipo) === -1) {
+        return responder(res, 400, { erro: 'Tipo invalido.' });
+      }
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const modelo = OO_URL + '/web-apps/apps/' +
+          (tipo === 'docx' ? 'documenteditor' : (tipo === 'xlsx' ? 'spreadsheeteditor' : 'presentationeditor')) +
+          '/main/resources/help/pt/new.' + tipo;
+
+        const nomeFicheiro = nome.replace(/\.(docx|xlsx|pptx)$/i, '') + '.' + tipo;
+        const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + limpar(nomeFicheiro);
+        const caminho = limpar(u.id) + '/' + unico;
+
+        guardarDeUrl(modelo, caminho, 'application/octet-stream', function (e3) {
+          if (e3) return responder(res, 502, { erro: 'Nao foi possivel criar: ' + e3.message });
+
+          const registo = {
+            'Owner': u.id,
+            'Name': unico,
+            'Original Name': nomeFicheiro,
+            'Extension': tipo,
+            'MIME Type': tipo === 'docx'
+              ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+              : (tipo === 'xlsx'
+                ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                : 'application/vnd.openxmlformats-officedocument.presentationml.presentation'),
+            'File Type': classificar(tipo),
+            'Storage Type': 'Bunny Storage',
+            'Status': 'Ready',
+            'Size Bytes': 12000,
+            'Bunny Path': caminho,
+            'CDN URL': CDN ? 'https://' + CDN + '/' + encodeURI(caminho) : '',
+            'Is Deleted': false,
+            'Is Shared': false
+          };
+          if (p.folder_id) registo['Folder'] = String(p.folder_id);
+
+          bubble('POST', '/stored file', registo, function (e4, j) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true, id: j.id || '', nome: nomeFicheiro });
+          });
+        });
+      });
+    });
+  }
+
+  /* ================= UPLOAD ================= */
+
   if (rota === '/token' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -385,27 +660,20 @@ const servidor = http.createServer(function (req, res) {
           return responder(res, 403, { erro: 'Sem espaco suficiente.' });
         }
 
-        /* ----- caminho Stream ----- */
         if (video) {
           return stream('POST', '/videos', { title: limparNome(nomeBruto) }, function (e3, v) {
             if (e3) return responder(res, 502, { erro: e3.message });
             const vid = v && v.guid;
             if (!vid) return responder(res, 502, { erro: 'O Stream nao devolveu o video.' });
-
             const expira = Math.floor(Date.now() / 1000) + 7200;
             responder(res, 200, {
-              ok: true,
-              modo: 'stream',
-              video_id: vid,
-              library: STREAM_LIB,
-              expires: expira,
-              signature: assinaturaTus(vid, expira),
+              ok: true, modo: 'stream', video_id: vid, library: STREAM_LIB,
+              expires: expira, signature: assinaturaTus(vid, expira),
               endpoint: 'https://video.bunnycdn.com/tusupload'
             });
           });
         }
 
-        /* ----- caminho Storage ----- */
         const dono = limpar(u.id);
         const unico = Date.now() + '-' + Math.floor(Math.random() * 100000) + '-' + nome;
         const caminho = dono + (pasta ? '/' + pasta : '') + '/' + unico;
@@ -417,7 +685,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- enviar para o Storage ---------- */
   if (rota === '/upload' && (metodo === 'POST' || metodo === 'PUT')) {
     if (!ZONE || !PASS || !HOST || !SEGREDO) {
       return responder(res, 500, { erro: 'Configuracao incompleta.' });
@@ -447,10 +714,8 @@ const servidor = http.createServer(function (req, res) {
     }
 
     const opcoes = {
-      hostname: HOST,
-      path: '/' + ZONE + '/' + encodeURI(caminho),
-      method: 'PUT',
-      headers: { 'AccessKey': PASS, 'Content-Type': tipo }
+      hostname: HOST, path: '/' + ZONE + '/' + encodeURI(caminho),
+      method: 'PUT', headers: { 'AccessKey': PASS, 'Content-Type': tipo }
     };
     if (req.headers['content-length']) opcoes.headers['Content-Length'] = req.headers['content-length'];
     else opcoes.headers['Transfer-Encoding'] = 'chunked';
@@ -473,7 +738,6 @@ const servidor = http.createServer(function (req, res) {
     return;
   }
 
-  /* ---------- registar ---------- */
   if (rota === '/create' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -490,7 +754,6 @@ const servidor = http.createServer(function (req, res) {
 
       carregarUtilizador(dono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
-
         if (!modoStream && caminho.indexOf(limpar(u.id) + '/') !== 0) {
           return responder(res, 403, { erro: 'Caminho nao pertence ao utilizador.' });
         }
@@ -534,7 +797,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- estado de um video ---------- */
   if (rota === '/video-status' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -555,7 +817,6 @@ const servidor = http.createServer(function (req, res) {
 
           stream('GET', '/videos/' + encodeURIComponent(vid), null, function (e4, v) {
             if (e4) return responder(res, 502, { erro: e4.message });
-
             const st = Number(v.status || 0);
             const pronto = st >= 3 && st <= 4;
             const falhou = st === 5 || st === 6;
@@ -566,12 +827,8 @@ const servidor = http.createServer(function (req, res) {
             }
 
             responder(res, 200, {
-              ok: true,
-              estado: novo,
-              progresso: Number(v.encodeProgress || 0),
-              duracao: Number(v.length || 0),
-              largura: Number(v.width || 0),
-              altura: Number(v.height || 0)
+              ok: true, estado: novo, progresso: Number(v.encodeProgress || 0),
+              duracao: Number(v.length || 0)
             });
           });
         });
@@ -579,7 +836,8 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- listar ---------- */
+  /* ================= GESTÃO ================= */
+
   if (rota === '/files' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -607,9 +865,8 @@ const servidor = http.createServer(function (req, res) {
           else cf.push({ key: 'Folder', constraint_type: 'is_empty' });
         }
 
-        const ordem = '&sort_field=Created Date&descending=true';
-
-        bubble('GET', '/stored file' + constraints(cf) + '&limit=100' + ordem, null, function (e3, jf) {
+        bubble('GET', '/stored file' + constraints(cf) + '&limit=100&sort_field=Created Date&descending=true',
+          null, function (e3, jf) {
           if (e3) return responder(res, 502, { erro: e3.message });
           const ficheiros = (((jf || {}).response || {}).results || []).map(mapear);
 
@@ -639,7 +896,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- apagar ---------- */
   if (rota === '/delete' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -700,7 +956,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- restaurar ---------- */
   if (rota === '/restore' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -724,7 +979,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- renomear ---------- */
   if (rota === '/rename' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -754,7 +1008,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- mover ---------- */
   if (rota === '/move' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -781,7 +1034,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- criar pasta ---------- */
   if (rota === '/folder' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -814,7 +1066,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- partilhar ---------- */
   if (rota === '/share' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -856,7 +1107,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- abrir partilha ---------- */
   if (rota === '/shared' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -900,7 +1150,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* ---------- link assinado ---------- */
   if (rota === '/link' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
