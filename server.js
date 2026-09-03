@@ -389,6 +389,110 @@ function mapear(f) {
   };
 }
 
+/* ============ MoPayment ============ */
+
+const MOZ_WALLET = String(process.env.MOZ_WALLET || '').trim();
+
+const MOZ_ROTAS = {
+  mpesa: '/api/1.1/wf/pagamentorotativompesa',
+  emola: '/api/1.1/wf/pagamentorotativoemola'
+};
+
+/* prefixos de operador, para avisar antes de cobrar */
+const PREFIXOS = {
+  mpesa: ['84', '85'],
+  emola: ['86', '87']
+};
+
+function limparNumero(bruto) {
+  let n = String(bruto || '').replace(/[^0-9]/g, '');
+  if (n.indexOf('258') === 0) n = n.substring(3);
+  return n;
+}
+
+function numeroValido(numero, metodo) {
+  if (!/^\d{9}$/.test(numero)) return 'O numero deve ter 9 digitos.';
+  const pre = numero.substring(0, 2);
+  const lista = PREFIXOS[metodo] || [];
+  if (lista.indexOf(pre) === -1) {
+    return metodo === 'mpesa'
+      ? 'Numeros M-Pesa comecam por 84 ou 85.'
+      : 'Numeros e-Mola comecam por 86 ou 87.';
+  }
+  return null;
+}
+
+function cobrar(metodo, numero, cliente, valor, cb) {
+  if (!MOZ_WALLET) return cb(new Error('Carteira de pagamento nao configurada.'));
+
+  const rota = MOZ_ROTAS[metodo];
+  if (!rota) return cb(new Error('Metodo de pagamento desconhecido.'));
+
+  const payload = JSON.stringify({
+    carteira: MOZ_WALLET,
+    numero: String(numero),
+    cliente: String(cliente || 'Cliente').substring(0, 80),
+    valor: String(valor)
+  });
+
+  const pedido = https.request({
+    hostname: 'mozpayment.co.mz',
+    path: rota,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  }, function (r) {
+    let texto = '';
+    r.on('data', function (c) { texto += c; });
+    r.on('end', function () {
+      let j = {};
+      try { j = JSON.parse(texto); } catch (e) {
+        return cb(new Error('Resposta ilegivel do sistema de pagamento.'));
+      }
+      /* o servidor devolve sempre 200 — o que conta e o campo cod */
+      cb(null, {
+        ok: Number(j.cod) === 200,
+        cod: Number(j.cod || 0),
+        mensagem: j.mensagem || j.detalhe || '',
+        transacao: j.transacao || '',
+        cru: j
+      });
+    });
+  });
+
+  pedido.setTimeout(120000, function () {
+    pedido.destroy(new Error('O pagamento demorou demasiado. Verifica o teu telemovel.'));
+  });
+  pedido.on('error', function (e) { cb(e); });
+  pedido.write(payload);
+  pedido.end();
+}
+
+function registarPagamento(u, dados, cb) {
+  const registo = {
+    'User': u.id,
+    'Method': dados.metodo,
+    'Phone': dados.numero,
+    'Amount MZN': Number(dados.valor || 0),
+    'Item Type': dados.tipo,
+    'Item Name': dados.nome || '',
+    'Item ID': dados.itemId || '',
+    'Status': dados.estado,
+    'Transaction': dados.transacao || '',
+    'Message': String(dados.mensagem || '').substring(0, 300)
+  };
+  bubble('POST', '/payment', registo, function (e, j) { cb(e, j); });
+}
+
+function somaDias(base, dias) {
+  const d = base ? new Date(base) : new Date();
+  const agora = new Date();
+  const inicio = (isNaN(d.getTime()) || d < agora) ? agora : d;
+  return new Date(inicio.getTime() + dias * 86400000).toISOString();
+}
+
 /* ============ SERVIDOR ============ */
 
 const servidor = http.createServer(function (req, res) {
@@ -403,16 +507,17 @@ const servidor = http.createServer(function (req, res) {
   if (rota === '/' || rota === '') {
     return responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-7',
+      versao: 'container-8',
       storage: Boolean(ZONE && PASS && HOST),
       bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
       cdn_assinado: Boolean(CDN_KEY),
       stream: Boolean(STREAM_LIB && STREAM_KEY && STREAM_CDN),
-      office: Boolean(OO_URL && OO_SECRET)
+      office: Boolean(OO_URL && OO_SECRET),
+      pagamento: Boolean(MOZ_WALLET)
     });
   }
 
-  /* ---------- planos ---------- */
+  /* ---------- planos e pacotes ---------- */
   if (rota === '/plans' && metodo === 'POST') {
     const c = [{ key: 'Is Active', constraint_type: 'equals', value: true }];
 
@@ -440,12 +545,12 @@ const servidor = http.createServer(function (req, res) {
             ordem: Number(p['Sort Order'] || 0)
           };
         });
-        responder(res, 200, { ok: true, planos: planos, packs: packs });
+        responder(res, 200, { ok: true, planos: planos, packs: packs, pagamento: Boolean(MOZ_WALLET) });
       });
     });
   }
 
-  /* ---------- conta: estado da subscrição ---------- */
+  /* ---------- conta ---------- */
   if (rota === '/account' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -454,18 +559,24 @@ const servidor = http.createServer(function (req, res) {
 
       carregarUtilizador(dono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
-        responder(res, 200, {
-          ok: true,
-          nome: u.nome,
-          usado: u.usado,
-          base: u.base,
-          extra: u.extra,
-          limite: u.limite,
-          expira: u.expira,
-          dias: u.dias,
-          expirado: u.expirado,
-          excesso: u.excesso,
-          bloqueio: porqueBloqueado(u)
+
+        const c = [{ key: 'User', constraint_type: 'equals', value: u.id }];
+        bubble('GET', '/payment' + constraints(c) + '&limit=10&sort_field=Created Date&descending=true',
+          null, function (e3, j3) {
+          const pagamentos = e3 ? [] : (((j3 || {}).response || {}).results || []).map(function (x) {
+            return {
+              id: x._id, metodo: x['Method'] || '', valor: Number(x['Amount MZN'] || 0),
+              item: x['Item Name'] || '', estado: x['Status'] || '',
+              transacao: x['Transaction'] || '', data: x['Created Date'] || ''
+            };
+          });
+
+          responder(res, 200, {
+            ok: true, nome: u.nome, usado: u.usado, base: u.base, extra: u.extra,
+            limite: u.limite, expira: u.expira, dias: u.dias, expirado: u.expirado,
+            excesso: u.excesso, bloqueio: porqueBloqueado(u),
+            pagamento: Boolean(MOZ_WALLET), pagamentos: pagamentos
+          });
         });
       });
     });
@@ -490,10 +601,9 @@ const servidor = http.createServer(function (req, res) {
 
           if (!falta) {
             return responder(res, 200, {
-              ok: true, cabe: true, falta: 0,
+              ok: true, cabe: true, falta: 0, plano_id: planoId,
               plano: pl['Name'] || '', label: pl['Storage Label'] || '',
-              preco: Number(pl['Price MZN'] || 0),
-              sugestao: null, packs: []
+              preco: Number(pl['Price MZN'] || 0), sugestao: null, packs: []
             });
           }
 
@@ -508,15 +618,138 @@ const servidor = http.createServer(function (req, res) {
                 chega: Number(x['Bytes'] || 0) >= falta
               };
             });
-
             const suficientes = packs.filter(function (x) { return x.chega; });
-            const sugestao = suficientes.length ? suficientes[0] : null;
 
             responder(res, 200, {
-              ok: true, cabe: false, falta: falta,
+              ok: true, cabe: false, falta: falta, plano_id: planoId,
               plano: pl['Name'] || '', label: pl['Storage Label'] || '',
               preco: Number(pl['Price MZN'] || 0),
-              sugestao: sugestao, packs: packs
+              sugestao: suficientes.length ? suficientes[0] : null,
+              packs: packs
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- PAGAR ---------- */
+  if (rota === '/pay' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      if (!MOZ_WALLET) return responder(res, 500, { erro: 'Pagamentos nao configurados.' });
+
+      const dono = String(p.owner || '').trim();
+      const meio = String(p.metodo || '').toLowerCase().trim();
+      const numero = limparNumero(p.numero);
+      const tipo = String(p.tipo || '').toLowerCase().trim();
+      const itemId = String(p.item_id || '').trim();
+      const anual = p.anual === true;
+
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+      if (['mpesa', 'emola'].indexOf(meio) === -1) {
+        return responder(res, 400, { erro: 'Escolhe M-Pesa ou e-Mola.' });
+      }
+      const erroNum = numeroValido(numero, meio);
+      if (erroNum) return responder(res, 400, { erro: erroNum });
+      if (['plan', 'pack'].indexOf(tipo) === -1) {
+        return responder(res, 400, { erro: 'Tipo de compra invalido.' });
+      }
+      if (!itemId) return responder(res, 400, { erro: 'Item em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const caminhoItem = tipo === 'plan'
+          ? '/plan/' + encodeURIComponent(itemId)
+          : '/storage pack/' + encodeURIComponent(itemId);
+
+        /* o preco vem SEMPRE da base de dados, nunca do browser */
+        bubble('GET', caminhoItem, null, function (e3, ji) {
+          if (e3) return responder(res, 404, { erro: 'Item nao encontrado.' });
+          const item = (ji && ji.response) || ji;
+
+          if (item['Is Active'] === false) {
+            return responder(res, 400, { erro: 'Este item ja nao esta disponivel.' });
+          }
+
+          const nome = item['Name'] || '';
+          let valor, dias;
+
+          if (tipo === 'plan') {
+            valor = Number(item['Price MZN'] || 0);
+            dias = 30;
+          } else {
+            valor = anual ? Number(item['Price Year MZN'] || 0) : Number(item['Price MZN'] || 0);
+            dias = anual ? 365 : 30;
+          }
+
+          if (!valor || valor <= 0) {
+            return responder(res, 400, {
+              erro: 'Este item nao tem preco definido. Fala connosco para negociar.'
+            });
+          }
+
+          cobrar(meio, numero, u.nome, valor, function (e4, r) {
+            if (e4) {
+              registarPagamento(u, {
+                metodo: meio, numero: numero, valor: valor, tipo: tipo,
+                nome: nome, itemId: itemId, estado: 'error', mensagem: e4.message
+              }, function () {});
+              return responder(res, 502, { erro: e4.message });
+            }
+
+            if (!r.ok) {
+              registarPagamento(u, {
+                metodo: meio, numero: numero, valor: valor, tipo: tipo,
+                nome: nome, itemId: itemId, estado: 'error',
+                mensagem: r.mensagem || ('cod ' + r.cod)
+              }, function () {});
+              return responder(res, 402, {
+                erro: r.mensagem || 'O pagamento nao foi aceite. Confirma o saldo e tenta outra vez.',
+                cod: r.cod
+              });
+            }
+
+            /* --- pagamento aceite --- */
+            const mudanca = {};
+
+            if (tipo === 'plan') {
+              mudanca['Plan'] = itemId;
+              mudanca['Storage Limit Bytes'] = Number(item['Storage Limit Bytes'] || 0);
+              mudanca['Max File Size Bytes'] = Number(item['Max File Size Bytes'] || 0);
+              mudanca['Plan Started'] = new Date().toISOString();
+              mudanca['Plan Expires'] = somaDias(u.expira, dias);
+              mudanca['Is Active'] = true;
+            } else {
+              mudanca['Extra Storage Bytes'] = u.extra + Number(item['Bytes'] || 0);
+              if (!u.expira || u.expirado) {
+                mudanca['Plan Expires'] = somaDias(null, 30);
+              }
+            }
+
+            bubble('PATCH', '/user/' + encodeURIComponent(u.id), mudanca, function (e5) {
+              registarPagamento(u, {
+                metodo: meio, numero: numero, valor: valor, tipo: tipo,
+                nome: nome, itemId: itemId, estado: 'success',
+                transacao: r.transacao, mensagem: r.mensagem
+              }, function () {});
+
+              if (e5) {
+                return responder(res, 500, {
+                  erro: 'O pagamento foi feito mas a conta nao actualizou. Guarda a referencia '
+                    + (r.transacao || '') + ' e fala connosco.',
+                  transacao: r.transacao
+                });
+              }
+
+              responder(res, 200, {
+                ok: true, transacao: r.transacao, valor: valor, item: nome,
+                expira: mudanca['Plan Expires'] || u.expira,
+                limite: tipo === 'plan'
+                  ? Number(item['Storage Limit Bytes'] || 0) + u.extra
+                  : u.base + u.extra + Number(item['Bytes'] || 0)
+              });
             });
           });
         });
@@ -588,7 +821,6 @@ const servidor = http.createServer(function (req, res) {
           if (!tipoDoc) return responder(res, 400, { erro: 'Este formato nao abre no editor.' });
 
           const caminho = f['Bunny Path'] || '';
-          /* editar exige subscricao valida */
           const bloqueio = porqueBloqueado(u);
           const podeEditar = p.edit === true && ooEditavel(ext) && !bloqueio;
 
@@ -755,18 +987,16 @@ const servidor = http.createServer(function (req, res) {
       carregarUtilizador(pedidoDono, function (e2, u) {
         if (e2) return responder(res, 403, { erro: e2.message });
 
-        /* --- subscricao --- */
         const bloqueio = porqueBloqueado(u);
         if (bloqueio) return responder(res, 403, { erro: bloqueio, bloqueado: true });
 
-        /* --- limites --- */
         if (u.maxFicheiro > 0 && tamanho > u.maxFicheiro) {
           return responder(res, 403, { erro: 'Ficheiro acima do limite do plano.' });
         }
         const livre = u.limite - u.usado;
         if (u.limite > 0 && tamanho > livre) {
           return responder(res, 403, {
-            erro: 'Sem espaco suficiente. Faltam ' + Math.max(0, tamanho - livre) + ' bytes.',
+            erro: 'Sem espaco suficiente.',
             excesso: true, falta: Math.max(0, tamanho - livre)
           });
         }
