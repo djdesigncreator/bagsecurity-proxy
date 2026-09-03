@@ -19,6 +19,8 @@ const OO_URL = (process.env.ONLYOFFICE_URL || '').replace(/\/+$/, '');
 const OO_SECRET = String(process.env.ONLYOFFICE_SECRET || '').trim();
 const SELF_URL = (process.env.SELF_URL || '').replace(/\/+$/, '');
 
+const MOZ_WALLET = String(process.env.MOZ_WALLET || '').trim();
+
 const PORTA = process.env.PORT || 8080;
 
 const CORS = {
@@ -193,7 +195,151 @@ function assinaturaTus(videoId, expira) {
     .update(STREAM_LIB + STREAM_KEY + expira + videoId).digest('hex');
 }
 
-/* ============ utilizador e subscrição ============ */
+/* ============ MoPayment ============ */
+
+const MOZ_ROTAS = {
+  mpesa: '/api/1.1/wf/pagamentorotativompesa',
+  emola: '/api/1.1/wf/pagamentorotativoemola'
+};
+
+const PREFIXOS = {
+  mpesa: ['84', '85'],
+  emola: ['86', '87']
+};
+
+function limparNumero(bruto) {
+  let n = String(bruto || '').replace(/[^0-9]/g, '');
+  if (n.indexOf('258') === 0) n = n.substring(3);
+  return n;
+}
+
+function numeroValido(numero, metodo) {
+  if (!/^\d{9}$/.test(numero)) return 'O numero deve ter 9 digitos.';
+  const pre = numero.substring(0, 2);
+  const lista = PREFIXOS[metodo] || [];
+  if (lista.indexOf(pre) === -1) {
+    return metodo === 'mpesa'
+      ? 'Numeros M-Pesa comecam por 84 ou 85.'
+      : 'Numeros e-Mola comecam por 86 ou 87.';
+  }
+  return null;
+}
+
+/* procura o codigo de estado onde quer que ele venha */
+function extrairCod(j) {
+  if (!j || typeof j !== 'object') return 0;
+  const chaves = ['cod', 'code', 'codigo', 'status_code', 'statusCode'];
+  for (let i = 0; i < chaves.length; i++) {
+    if (j[chaves[i]] !== undefined && j[chaves[i]] !== null) {
+      const n = Number(j[chaves[i]]);
+      if (!isNaN(n)) return n;
+    }
+  }
+  /* o Bubble as vezes embrulha em response */
+  if (j.response && typeof j.response === 'object') return extrairCod(j.response);
+  return 0;
+}
+
+function extrairTexto(j, chaves) {
+  if (!j || typeof j !== 'object') return '';
+  for (let i = 0; i < chaves.length; i++) {
+    const v = j[chaves[i]];
+    if (typeof v === 'string' && v) return v;
+  }
+  if (j.response && typeof j.response === 'object') return extrairTexto(j.response, chaves);
+  return '';
+}
+
+function sucessoPago(j, cod) {
+  if (cod === 200 || cod === 201) return true;
+  const estado = String(extrairTexto(j, ['status', 'estado', 'result'])).toLowerCase();
+  if (estado === 'success' || estado === 'sucesso' || estado === 'ok') return true;
+  return false;
+}
+
+function cobrar(metodo, numero, cliente, valor, cb) {
+  if (!MOZ_WALLET) return cb(new Error('Carteira de pagamento nao configurada.'));
+
+  const rota = MOZ_ROTAS[metodo];
+  if (!rota) return cb(new Error('Metodo de pagamento desconhecido.'));
+
+  const payload = JSON.stringify({
+    carteira: MOZ_WALLET,
+    numero: String(numero),
+    cliente: String(cliente || 'Cliente').substring(0, 80),
+    valor: String(valor)
+  });
+
+  const pedido = https.request({
+    hostname: 'mozpayment.co.mz',
+    path: rota,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  }, function (r) {
+    let texto = '';
+    r.on('data', function (c) { texto += c; });
+    r.on('end', function () {
+      let j = null;
+      try { j = JSON.parse(texto); } catch (e) { j = null; }
+
+      if (!j) {
+        return cb(null, {
+          ok: false, cod: -1,
+          mensagem: 'Resposta ilegivel do sistema de pagamento.',
+          transacao: '',
+          bruto: 'HTTP ' + r.statusCode + ' | ' + String(texto).substring(0, 700)
+        });
+      }
+
+      const cod = extrairCod(j);
+      const ok = sucessoPago(j, cod);
+
+      cb(null, {
+        ok: ok,
+        cod: cod,
+        mensagem: extrairTexto(j, ['mensagem', 'message', 'detalhe', 'detail', 'erro', 'error']),
+        transacao: extrairTexto(j, ['transacao', 'transaction', 'reference', 'referencia', 'id']),
+        bruto: 'HTTP ' + r.statusCode + ' | ' + JSON.stringify(j).substring(0, 700)
+      });
+    });
+  });
+
+  pedido.setTimeout(180000, function () {
+    pedido.destroy(new Error('O pagamento demorou demasiado. Verifica o teu telemovel.'));
+  });
+  pedido.on('error', function (e) { cb(e); });
+  pedido.write(payload);
+  pedido.end();
+}
+
+function registarPagamento(u, d, cb) {
+  const registo = {
+    'User': u.id,
+    'Method': d.metodo || '',
+    'Phone': d.numero || '',
+    'Amount MZN': Number(d.valor || 0),
+    'Item Type': d.tipo || '',
+    'Item Name': d.nome || '',
+    'Item ID': d.itemId || '',
+    'Status': d.estado || '',
+    'Transaction': d.transacao || '',
+    'Message': String(d.mensagem || '').substring(0, 400),
+    'Raw': String(d.bruto || '').substring(0, 900)
+  };
+  bubble('POST', '/payment', registo, function (e, j) { if (cb) cb(e, j); });
+}
+
+function somaDias(base, dias) {
+  const d = base ? new Date(base) : new Date();
+  const agora = new Date();
+  const inicio = (isNaN(d.getTime()) || d < agora) ? agora : d;
+  return new Date(inicio.getTime() + dias * 86400000).toISOString();
+}
+
+/* ============ utilizador ============ */
 
 function diasAte(iso) {
   if (!iso) return null;
@@ -218,22 +364,17 @@ function carregarUtilizador(id, cb) {
     cb(null, {
       id: d._id,
       nome: d['Full Name'] || 'Utilizador',
-      base: base,
-      extra: extra,
-      limite: limite,
-      usado: usado,
+      base: base, extra: extra, limite: limite, usado: usado,
       maxFicheiro: Number(d['Max File Size Bytes'] || 0),
       plano: d['Plan'] || '',
       activo: d['Is Active'] !== false,
-      expira: expiraEm,
-      dias: dias,
+      expira: expiraEm, dias: dias,
       expirado: dias !== null && dias <= 0,
       excesso: limite > 0 && usado > limite
     });
   });
 }
 
-/* devolve a razão do bloqueio, ou null se pode enviar */
 function porqueBloqueado(u) {
   if (!u.activo) return 'A tua conta esta suspensa. Fala connosco.';
   if (!u.expira) return 'A tua subscricao nao esta activa. Escolhe um plano para comecares.';
@@ -244,7 +385,7 @@ function porqueBloqueado(u) {
   return null;
 }
 
-/* ============ URL assinado do CDN ============ */
+/* ============ URL assinado ============ */
 
 function urlAssinado(caminho, segundos) {
   if (!CDN) return '';
@@ -274,7 +415,6 @@ function apagarNoBunny(caminho, cb) {
   p.end();
 }
 
-/* guarda no Storage um ficheiro vindo de um URL */
 function guardarDeUrl(origem, caminho, tipo, cb) {
   let u;
   try { u = new URL(origem); } catch (e) { return cb(new Error('URL de origem invalido.')); }
@@ -310,7 +450,7 @@ function guardarDeUrl(origem, caminho, tipo, cb) {
   leitura.on('error', function (e) { cb(e); });
 }
 
-/* ============ classificar por extensão ============ */
+/* ============ classificar ============ */
 
 const TIPOS = {
   Video: ['mp4','mov','webm','avi','mkv','m4v','mpg','mpeg','wmv','flv','3gp','ts'],
@@ -335,7 +475,7 @@ function eVideo(ext) {
   return TIPOS.Video.indexOf(String(ext || '').toLowerCase()) !== -1;
 }
 
-/* ============ OnlyOffice: formatos ============ */
+/* ============ OnlyOffice ============ */
 
 const OO_TEXTO = ['docx','doc','odt','rtf','txt','html','epub','fb2','pdf','djvu','xps','md'];
 const OO_FOLHA = ['xlsx','xls','ods','csv'];
@@ -354,7 +494,7 @@ function ooEditavel(ext) {
   return OO_EDITAVEL.indexOf(String(ext || '').toLowerCase()) !== -1;
 }
 
-/* ============ mapear ficheiro para a aplicação ============ */
+/* ============ mapear ============ */
 
 function mapear(f) {
   const noStream = f['Storage Type'] === 'Bunny Stream';
@@ -389,110 +529,6 @@ function mapear(f) {
   };
 }
 
-/* ============ MoPayment ============ */
-
-const MOZ_WALLET = String(process.env.MOZ_WALLET || '').trim();
-
-const MOZ_ROTAS = {
-  mpesa: '/api/1.1/wf/pagamentorotativompesa',
-  emola: '/api/1.1/wf/pagamentorotativoemola'
-};
-
-/* prefixos de operador, para avisar antes de cobrar */
-const PREFIXOS = {
-  mpesa: ['84', '85'],
-  emola: ['86', '87']
-};
-
-function limparNumero(bruto) {
-  let n = String(bruto || '').replace(/[^0-9]/g, '');
-  if (n.indexOf('258') === 0) n = n.substring(3);
-  return n;
-}
-
-function numeroValido(numero, metodo) {
-  if (!/^\d{9}$/.test(numero)) return 'O numero deve ter 9 digitos.';
-  const pre = numero.substring(0, 2);
-  const lista = PREFIXOS[metodo] || [];
-  if (lista.indexOf(pre) === -1) {
-    return metodo === 'mpesa'
-      ? 'Numeros M-Pesa comecam por 84 ou 85.'
-      : 'Numeros e-Mola comecam por 86 ou 87.';
-  }
-  return null;
-}
-
-function cobrar(metodo, numero, cliente, valor, cb) {
-  if (!MOZ_WALLET) return cb(new Error('Carteira de pagamento nao configurada.'));
-
-  const rota = MOZ_ROTAS[metodo];
-  if (!rota) return cb(new Error('Metodo de pagamento desconhecido.'));
-
-  const payload = JSON.stringify({
-    carteira: MOZ_WALLET,
-    numero: String(numero),
-    cliente: String(cliente || 'Cliente').substring(0, 80),
-    valor: String(valor)
-  });
-
-  const pedido = https.request({
-    hostname: 'mozpayment.co.mz',
-    path: rota,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(payload)
-    }
-  }, function (r) {
-    let texto = '';
-    r.on('data', function (c) { texto += c; });
-    r.on('end', function () {
-      let j = {};
-      try { j = JSON.parse(texto); } catch (e) {
-        return cb(new Error('Resposta ilegivel do sistema de pagamento.'));
-      }
-      /* o servidor devolve sempre 200 — o que conta e o campo cod */
-      cb(null, {
-        ok: Number(j.cod) === 200,
-        cod: Number(j.cod || 0),
-        mensagem: j.mensagem || j.detalhe || '',
-        transacao: j.transacao || '',
-        cru: j
-      });
-    });
-  });
-
-  pedido.setTimeout(120000, function () {
-    pedido.destroy(new Error('O pagamento demorou demasiado. Verifica o teu telemovel.'));
-  });
-  pedido.on('error', function (e) { cb(e); });
-  pedido.write(payload);
-  pedido.end();
-}
-
-function registarPagamento(u, dados, cb) {
-  const registo = {
-    'User': u.id,
-    'Method': dados.metodo,
-    'Phone': dados.numero,
-    'Amount MZN': Number(dados.valor || 0),
-    'Item Type': dados.tipo,
-    'Item Name': dados.nome || '',
-    'Item ID': dados.itemId || '',
-    'Status': dados.estado,
-    'Transaction': dados.transacao || '',
-    'Message': String(dados.mensagem || '').substring(0, 300)
-  };
-  bubble('POST', '/payment', registo, function (e, j) { cb(e, j); });
-}
-
-function somaDias(base, dias) {
-  const d = base ? new Date(base) : new Date();
-  const agora = new Date();
-  const inicio = (isNaN(d.getTime()) || d < agora) ? agora : d;
-  return new Date(inicio.getTime() + dias * 86400000).toISOString();
-}
-
 /* ============ SERVIDOR ============ */
 
 const servidor = http.createServer(function (req, res) {
@@ -507,7 +543,7 @@ const servidor = http.createServer(function (req, res) {
   if (rota === '/' || rota === '') {
     return responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-8',
+      versao: 'container-9',
       storage: Boolean(ZONE && PASS && HOST),
       bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
       cdn_assinado: Boolean(CDN_KEY),
@@ -664,7 +700,6 @@ const servidor = http.createServer(function (req, res) {
           ? '/plan/' + encodeURIComponent(itemId)
           : '/storage pack/' + encodeURIComponent(itemId);
 
-        /* o preco vem SEMPRE da base de dados, nunca do browser */
         bubble('GET', caminhoItem, null, function (e3, ji) {
           if (e3) return responder(res, 404, { erro: 'Item nao encontrado.' });
           const item = (ji && ji.response) || ji;
@@ -691,27 +726,35 @@ const servidor = http.createServer(function (req, res) {
           }
 
           cobrar(meio, numero, u.nome, valor, function (e4, r) {
+
+            /* falha de ligacao */
             if (e4) {
               registarPagamento(u, {
                 metodo: meio, numero: numero, valor: valor, tipo: tipo,
-                nome: nome, itemId: itemId, estado: 'error', mensagem: e4.message
-              }, function () {});
+                nome: nome, itemId: itemId, estado: 'error',
+                mensagem: e4.message, bruto: 'EXCEPCAO: ' + String(e4.message || '')
+              });
               return responder(res, 502, { erro: e4.message });
             }
 
+            /* recusado */
             if (!r.ok) {
               registarPagamento(u, {
                 metodo: meio, numero: numero, valor: valor, tipo: tipo,
                 nome: nome, itemId: itemId, estado: 'error',
-                mensagem: r.mensagem || ('cod ' + r.cod)
-              }, function () {});
+                transacao: r.transacao,
+                mensagem: r.mensagem || ('cod ' + r.cod),
+                bruto: r.bruto
+              });
               return responder(res, 402, {
                 erro: r.mensagem || 'O pagamento nao foi aceite. Confirma o saldo e tenta outra vez.',
-                cod: r.cod
+                cod: r.cod,
+                transacao: r.transacao,
+                detalhe: r.bruto
               });
             }
 
-            /* --- pagamento aceite --- */
+            /* --- aceite --- */
             const mudanca = {};
 
             if (tipo === 'plan') {
@@ -729,11 +772,15 @@ const servidor = http.createServer(function (req, res) {
             }
 
             bubble('PATCH', '/user/' + encodeURIComponent(u.id), mudanca, function (e5) {
+
               registarPagamento(u, {
                 metodo: meio, numero: numero, valor: valor, tipo: tipo,
-                nome: nome, itemId: itemId, estado: 'success',
-                transacao: r.transacao, mensagem: r.mensagem
-              }, function () {});
+                nome: nome, itemId: itemId,
+                estado: e5 ? 'error' : 'success',
+                transacao: r.transacao,
+                mensagem: e5 ? ('Pago mas nao aplicado: ' + e5.message) : (r.mensagem || 'Pago'),
+                bruto: r.bruto
+              });
 
               if (e5) {
                 return responder(res, 500, {
