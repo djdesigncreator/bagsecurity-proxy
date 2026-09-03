@@ -939,6 +939,215 @@ function mapear(f) {
   };
 }
 
+/* ============ EMAIL pelo Resend ============ */
+
+const RESEND_KEY = String(process.env.RESEND_KEY || '').trim();
+const MAIL_FROM = String(process.env.MAIL_FROM || '').trim();
+const APP_URL = (process.env.APP_URL || '').replace(/\/+$/, '');
+
+/* gera um codigo curto, facil de ler e de escrever */
+function gerarCodigo() {
+  /* sem I, O, 0, 1 para nao confundir */
+  const letras = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const numeros = '23456789';
+  const bytes = crypto.randomBytes(8);
+  let saida = '';
+  for (let i = 0; i < 8; i++) {
+    const fonte = i < 4 ? letras : numeros;
+    saida += fonte[bytes[i] % fonte.length];
+  }
+  return saida;
+}
+
+function escaparHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function enviarEmail(para, assunto, html, texto, cb) {
+  if (!RESEND_KEY || !MAIL_FROM) {
+    return cb(new Error('Envio de email nao configurado.'));
+  }
+
+  const payload = JSON.stringify({
+    from: MAIL_FROM,
+    to: [String(para)],
+    subject: String(assunto),
+    html: html,
+    text: texto || ''
+  });
+
+  const pedido = https.request({
+    hostname: 'api.resend.com',
+    path: '/emails',
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + RESEND_KEY,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload)
+    }
+  }, function (r) {
+    let corpo = '';
+    r.on('data', function (c) { corpo += c; });
+    r.on('end', function () {
+      if (r.statusCode < 200 || r.statusCode >= 300) {
+        let detalhe = corpo.substring(0, 200);
+        try {
+          const j = JSON.parse(corpo);
+          detalhe = j.message || j.name || detalhe;
+        } catch (e) {}
+        return cb(new Error('Resend ' + r.statusCode + ': ' + detalhe));
+      }
+      let id = '';
+      try { id = (JSON.parse(corpo) || {}).id || ''; } catch (e) {}
+      cb(null, { id: id });
+    });
+  });
+
+  pedido.setTimeout(20000, function () {
+    pedido.destroy(new Error('O envio de email demorou demasiado.'));
+  });
+  pedido.on('error', function (e) { cb(e); });
+  pedido.write(payload);
+  pedido.end();
+}
+
+/* ---------- modelo do email ---------- */
+
+function moldura(titulo, corpo) {
+  return '<div style="margin:0;padding:26px 14px;background:#F4F8F1;'
+    + 'font-family:Helvetica,Arial,sans-serif">'
+
+    + '<div style="max-width:520px;margin:0 auto;background:#FFFFFF;'
+    + 'border:1px solid #E2EBDC;border-radius:16px;overflow:hidden">'
+
+    /* cabecalho */
+    + '<div style="background:#14582A;padding:26px 28px">'
+    + '<div style="font-size:21px;font-weight:700;color:#FFFFFF;letter-spacing:-.5px">'
+    + 'bag<span style="color:#7AC423">Security</span></div>'
+    + '<div style="font-size:11px;color:#8FC474;margin-top:3px">'
+    + 'Hospedagem de arquivos segura</div>'
+    + '</div>'
+
+    /* corpo */
+    + '<div style="padding:30px 28px">'
+    + '<div style="font-size:20px;font-weight:700;color:#12281A;'
+    + 'margin:0 0 14px;letter-spacing:-.4px">' + titulo + '</div>'
+    + corpo
+    + '</div>'
+
+    /* rodape */
+    + '<div style="padding:20px 28px;background:#F4F8F1;border-top:1px solid #E2EBDC">'
+    + '<div style="font-size:12px;color:#5F7565;line-height:1.6">'
+    + 'Segurança primeiro, <b style="color:#12281A">hospedagem depois.</b></div>'
+    + '<div style="font-size:11px;color:#A8BCA0;margin-top:8px;line-height:1.6">'
+    + 'Recebeste este email porque alguém usou este endereço na Bag Security. '
+    + 'Se não foste tu, ignora esta mensagem.</div>'
+    + '</div>'
+
+    + '</div></div>';
+}
+
+function emailCodigo(nome, codigo) {
+  const corpo =
+    '<p style="font-size:15px;color:#5F7565;line-height:1.7;margin:0 0 22px">'
+    + 'Olá ' + escaparHtml(nome) + ', falta só um passo. '
+    + 'Escreve este código na página para confirmares o teu email.</p>'
+
+    + '<div style="background:#EEF8E2;border:1px solid #D5EDBB;border-radius:13px;'
+    + 'padding:22px;text-align:center;margin:0 0 22px">'
+    + '<div style="font-size:11px;color:#66A81A;font-weight:600;'
+    + 'letter-spacing:1.4px;text-transform:uppercase;margin-bottom:9px">'
+    + 'O teu código</div>'
+    + '<div style="font-size:31px;font-weight:700;color:#1E6B33;'
+    + 'letter-spacing:7px;font-family:Consolas,Monaco,monospace">'
+    + escaparHtml(codigo) + '</div>'
+    + '</div>'
+
+    + '<p style="font-size:13.5px;color:#5F7565;line-height:1.7;margin:0">'
+    + 'O código é válido durante 30 minutos. '
+    + 'Se expirar, podes pedir outro na mesma página.</p>';
+
+  const texto = 'Ola ' + nome + ',\n\n'
+    + 'O teu codigo de confirmacao e: ' + codigo + '\n\n'
+    + 'Valido durante 30 minutos.\n\n'
+    + 'Bag Security';
+
+  return { html: moldura('Confirma o teu email', corpo), texto: texto };
+}
+
+function emailBemVindo(nome) {
+  const botao = APP_URL
+    ? '<div style="margin:0 0 22px">'
+      + '<a href="' + APP_URL + '" style="display:inline-block;background:#7AC423;'
+      + 'color:#14582A;text-decoration:none;font-size:15px;font-weight:700;'
+      + 'padding:14px 30px;border-radius:11px">Abrir a minha conta</a></div>'
+    : '';
+
+  const corpo =
+    '<p style="font-size:15px;color:#5F7565;line-height:1.7;margin:0 0 22px">'
+    + 'Olá ' + escaparHtml(nome) + ', a tua conta está pronta. '
+    + 'Tens 200 MB para começares, sem pagar nada.</p>'
+    + botao
+    + '<div style="border-top:1px solid #E2EBDC;padding-top:20px">'
+    + '<div style="font-size:13.5px;color:#12281A;font-weight:600;margin-bottom:12px">'
+    + 'O que podes fazer já:</div>'
+    + '<div style="font-size:13.5px;color:#5F7565;line-height:1.9">'
+    + '&bull; Enviar ficheiros e vídeos, que convertemos automaticamente<br>'
+    + '&bull; Criar e editar Word, Excel e PowerPoint no browser<br>'
+    + '&bull; Partilhar por link, com prazo e password<br>'
+    + '&bull; Enviar ficheiros a quem também tem conta'
+    + '</div></div>';
+
+  const texto = 'Ola ' + nome + ',\n\n'
+    + 'A tua conta Bag Security esta pronta. Tens 200 MB gratis para comecares.\n\n'
+    + (APP_URL ? APP_URL + '\n\n' : '')
+    + 'Bag Security';
+
+  return { html: moldura('Conta criada', corpo), texto: texto };
+}
+
+function emailAviso(nome, dias) {
+  const quando = dias <= 0 ? 'expirou'
+    : (dias === 1 ? 'acaba amanhã' : 'acaba dentro de ' + dias + ' dias');
+
+  const botao = APP_URL
+    ? '<div style="margin:0 0 22px">'
+      + '<a href="' + APP_URL + '" style="display:inline-block;background:#7AC423;'
+      + 'color:#14582A;text-decoration:none;font-size:15px;font-weight:700;'
+      + 'padding:14px 30px;border-radius:11px">Renovar agora</a></div>'
+    : '';
+
+  const corpo =
+    '<p style="font-size:15px;color:#5F7565;line-height:1.7;margin:0 0 22px">'
+    + 'Olá ' + escaparHtml(nome) + ', o teu plano ' + quando + '.</p>'
+    + botao
+    + '<p style="font-size:13.5px;color:#5F7565;line-height:1.7;margin:0">'
+    + 'Os teus ficheiros continuam acessíveis. Só os envios de ficheiros novos '
+    + 'ficam suspensos até renovares.</p>';
+
+  const texto = 'Ola ' + nome + ',\n\n'
+    + 'O teu plano Bag Security ' + quando + '.\n'
+    + 'Os teus ficheiros continuam acessiveis.\n\n'
+    + (APP_URL ? APP_URL + '\n\n' : '')
+    + 'Bag Security';
+
+  return { html: moldura('O teu plano ' + quando, corpo), texto: texto };
+}
+
+/* limita quantos codigos se podem pedir por hora */
+const PEDIDOS = {};
+
+function podePedir(chave) {
+  const agora = Date.now();
+  const lista = (PEDIDOS[chave] || []).filter(function (t) { return agora - t < 3600000; });
+  PEDIDOS[chave] = lista;
+  if (lista.length >= 5) return false;
+  lista.push(agora);
+  return true;
+}
+
 /* ============ SERVIDOR ============ */
 
 const servidor = http.createServer(function (req, res) {
@@ -2257,6 +2466,186 @@ const servidor = http.createServer(function (req, res) {
           }
           const m = mapear(f);
           responder(res, 200, { ok: true, url: m.url, player: m.player });
+        });
+      });
+    });
+  }
+
+  /* ================= CONTA E EMAIL ================= */
+
+  /* gera um codigo novo e envia por email */
+  if (rota === '/signup-code' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      const dono = String(p.owner || '').trim();
+      const primeiro = p.welcome === true;
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      if (!podePedir(dono)) {
+        return responder(res, 429, {
+          erro: 'Pediste codigos demasiadas vezes. Espera uma hora e tenta outra vez.'
+        });
+      }
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+        if (!u.email) return responder(res, 400, { erro: 'Esta conta nao tem email.' });
+
+        const codigo = gerarCodigo();
+        const validade = new Date(Date.now() + 1800000).toISOString();
+
+        bubble('PATCH', '/user/' + encodeURIComponent(u.id), {
+          'Token': codigo,
+          'Token Expires': validade,
+          'Token Confirmado': false
+        }, function (e3) {
+          if (e3) return responder(res, 502, { erro: 'Nao foi possivel guardar o codigo.' });
+
+          const m = emailCodigo(u.nome, codigo);
+          enviarEmail(u.email, 'O teu codigo Bag Security: ' + codigo,
+            m.html, m.texto, function (e4, r) {
+            if (e4) {
+              return responder(res, 502, {
+                erro: 'A conta foi criada mas o email nao saiu. '
+                  + 'Carrega em reenviar daqui a pouco.',
+                detalhe: e4.message
+              });
+            }
+            responder(res, 200, {
+              ok: true, email: u.email, expira: validade, id: r.id, primeiro: primeiro
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* confirma o codigo escrito pela pessoa */
+  if (rota === '/verify-code' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      const dono = String(p.owner || '').trim();
+      const codigo = String(p.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+      if (codigo.length !== 8) return responder(res, 400, { erro: 'Codigo incompleto.' });
+
+      bubble('GET', '/user/' + encodeURIComponent(dono), null, function (e2, j) {
+        if (e2) return responder(res, 403, { erro: 'Utilizador nao encontrado.' });
+        const d = (j && j.response) || j;
+        const u = moldarUtilizador(d);
+
+        if (d['Token Confirmado'] === true) {
+          return responder(res, 200, { ok: true, ja_confirmado: true });
+        }
+
+        const guardado = String(d['Token'] || '').toUpperCase();
+        const expira = d['Token Expires'] || '';
+
+        if (!guardado) {
+          return responder(res, 400, {
+            erro: 'Nao ha nenhum codigo por confirmar. Pede um novo.'
+          });
+        }
+
+        if (expira && new Date(expira) < new Date()) {
+          return responder(res, 410, {
+            erro: 'O codigo expirou. Carrega em reenviar para receberes outro.',
+            expirado: true
+          });
+        }
+
+        if (!iguais(guardado, codigo)) {
+          return responder(res, 401, {
+            erro: 'Codigo errado. Confere o email e tenta outra vez.'
+          });
+        }
+
+        bubble('PATCH', '/user/' + encodeURIComponent(u.id), {
+          'Token Confirmado': true,
+          'Token': ''
+        }, function (e3) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          const m = emailBemVindo(u.nome);
+          enviarEmail(u.email, 'Bem-vindo a Bag Security', m.html, m.texto, function () {});
+
+          responder(res, 200, { ok: true, nome: u.nome });
+        });
+      });
+    });
+  }
+
+  /* avisa quem tem o plano a acabar — para correr uma vez por dia */
+  if (rota === '/plan-warnings' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      /* protegido pelo segredo do container */
+      const chave = String(p.key || '');
+      if (!SEGREDO || chave !== SEGREDO) {
+        return responder(res, 403, { erro: 'Nao autorizado.' });
+      }
+
+      const limite = new Date(Date.now() + 3 * 86400000).toISOString();
+      const c = [
+        { key: 'Plan Expires', constraint_type: 'less than', value: limite },
+        { key: 'Is Active', constraint_type: 'equals', value: true }
+      ];
+
+      bubble('GET', '/user' + constraints(c) + '&limit=100', null, function (e2, j) {
+        if (e2) return responder(res, 502, { erro: e2.message });
+        const lista = (((j || {}).response || {}).results || []);
+
+        if (!lista.length) return responder(res, 200, { ok: true, avisados: 0 });
+
+        let feitos = 0, falhas = 0;
+
+        lista.forEach(function (d) {
+          const u = moldarUtilizador(d);
+          if (!u.email || u.dias === null) { feitos++; return; }
+          if (u.dias > 3) { feitos++; return; }
+
+          const m = emailAviso(u.nome, u.dias);
+          enviarEmail(u.email, u.dias <= 0
+            ? 'O teu plano Bag Security expirou'
+            : 'O teu plano Bag Security esta a acabar',
+            m.html, m.texto, function (e3) {
+            if (e3) falhas++;
+            feitos++;
+            if (feitos === lista.length) {
+              responder(res, 200, { ok: true, avisados: feitos - falhas, falhas: falhas });
+            }
+          });
+        });
+
+        /* se todos foram saltados */
+        setTimeout(function () {
+          if (feitos === lista.length && !res.headersSent) {
+            responder(res, 200, { ok: true, avisados: 0 });
+          }
+        }, 200);
+      });
+    });
+  }
+
+  /* estado do email de um utilizador */
+  if (rota === '/mail-status' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      bubble('GET', '/user/' + encodeURIComponent(dono), null, function (e2, j) {
+        if (e2) return responder(res, 403, { erro: 'Utilizador nao encontrado.' });
+        const d = (j && j.response) || j;
+        const u = moldarUtilizador(d);
+        responder(res, 200, {
+          ok: true,
+          email: u.email,
+          confirmado: d['Token Confirmado'] === true,
+          nome: u.nome
         });
       });
     });
