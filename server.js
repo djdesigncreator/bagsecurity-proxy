@@ -2650,7 +2650,273 @@ const servidor = http.createServer(function (req, res) {
       });
     });
   }
+  /* ================= PLAYLISTS ================= */
 
+  /* lista as playlists do utilizador */
+  if (rota === '/playlists' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const c = [
+          { key: 'Owner', constraint_type: 'equals', value: u.id },
+          { key: 'Is Deleted', constraint_type: 'equals', value: false }
+        ];
+
+        bubble('GET', '/playlist' + constraints(c) + '&limit=100&sort_field=Created Date&descending=true',
+          null, function (e3, j) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          const listas = (((j || {}).response || {}).results || []).map(function (x) {
+            const ids = String(x['Track IDs'] || '').split(',')
+              .map(function (s) { return s.trim(); })
+              .filter(Boolean);
+            return {
+              id: x._id,
+              nome: x['Name'] || '',
+              tipo: x['Kind'] || 'mix',
+              faixas: ids.length,
+              criado: x['Created Date'] || ''
+            };
+          });
+
+          responder(res, 200, { ok: true, listas: listas });
+        });
+      });
+    });
+  }
+
+  /* abre uma playlist com as faixas todas, pela ordem certa */
+  if (rota === '/playlist' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        bubble('GET', '/playlist/' + encodeURIComponent(id), null, function (e3, jl) {
+          if (e3) return responder(res, 404, { erro: 'Lista nao encontrada.' });
+          const l = (jl && jl.response) || jl;
+          if (String(l['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Esta lista nao e tua.' });
+          }
+
+          const ids = String(l['Track IDs'] || '').split(',')
+            .map(function (s) { return s.trim(); })
+            .filter(Boolean);
+
+          if (!ids.length) {
+            return responder(res, 200, {
+              ok: true, id: l._id, nome: l['Name'] || '',
+              tipo: l['Kind'] || 'mix', faixas: []
+            });
+          }
+
+          /* busca os ficheiros e devolve pela ordem guardada */
+          const cs = [
+            { key: 'Owner', constraint_type: 'equals', value: u.id },
+            { key: 'Is Deleted', constraint_type: 'equals', value: false }
+          ];
+
+          bubble('GET', '/stored file' + constraints(cs) + '&limit=200', null, function (e4, jf) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            const todos = (((jf || {}).response || {}).results || []);
+
+            const mapa = {};
+            todos.forEach(function (f) { mapa[f._id] = f; });
+
+            const faixas = [];
+            ids.forEach(function (fid) {
+              if (mapa[fid]) faixas.push(mapear(mapa[fid]));
+            });
+
+            responder(res, 200, {
+              ok: true, id: l._id, nome: l['Name'] || '',
+              tipo: l['Kind'] || 'mix', faixas: faixas
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* cria ou muda uma playlist */
+  if (rota === '/playlist-save' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const nome = limparNome(p.name);
+      const id = String(p.id || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+      if (!id && !nome) return responder(res, 400, { erro: 'Escreve um nome para a lista.' });
+
+      /* limpa e limita os identificadores das faixas */
+      const ids = (Array.isArray(p.tracks) ? p.tracks : [])
+        .map(function (s) { return String(s || '').trim(); })
+        .filter(Boolean)
+        .slice(0, 300);
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const tipo = ['audio', 'video', 'mix'].indexOf(String(p.kind || '')) !== -1
+          ? String(p.kind) : 'mix';
+
+        /* actualizar uma existente */
+        if (id) {
+          return bubble('GET', '/playlist/' + encodeURIComponent(id), null, function (e3, jl) {
+            if (e3) return responder(res, 404, { erro: 'Lista nao encontrada.' });
+            const l = (jl && jl.response) || jl;
+            if (String(l['Owner']) !== String(u.id)) {
+              return responder(res, 403, { erro: 'Esta lista nao e tua.' });
+            }
+
+            const mudanca = {};
+            if (nome) mudanca['Name'] = nome;
+            if (p.tracks !== undefined) mudanca['Track IDs'] = ids.join(',');
+            if (p.kind) mudanca['Kind'] = tipo;
+
+            bubble('PATCH', '/playlist/' + encodeURIComponent(id), mudanca, function (e4) {
+              if (e4) return responder(res, 502, { erro: e4.message });
+              responder(res, 200, { ok: true, id: id, nome: nome || l['Name'] || '' });
+            });
+          });
+        }
+
+        /* criar nova */
+        bubble('POST', '/playlist', {
+          'Name': nome,
+          'Owner': u.id,
+          'Kind': tipo,
+          'Track IDs': ids.join(','),
+          'Is Deleted': false
+        }, function (e5, j) {
+          if (e5) return responder(res, 502, { erro: e5.message });
+          responder(res, 200, { ok: true, id: j.id || '', nome: nome });
+        });
+      });
+    });
+  }
+
+  /* acrescenta faixas a uma lista, sem repetir */
+  if (rota === '/playlist-add' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      const novos = (Array.isArray(p.tracks) ? p.tracks : [String(p.track || '')])
+        .map(function (s) { return String(s || '').trim(); })
+        .filter(Boolean);
+
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+      if (!novos.length) return responder(res, 400, { erro: 'Nenhuma faixa indicada.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        bubble('GET', '/playlist/' + encodeURIComponent(id), null, function (e3, jl) {
+          if (e3) return responder(res, 404, { erro: 'Lista nao encontrada.' });
+          const l = (jl && jl.response) || jl;
+          if (String(l['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Esta lista nao e tua.' });
+          }
+
+          const actuais = String(l['Track IDs'] || '').split(',')
+            .map(function (s) { return s.trim(); })
+            .filter(Boolean);
+
+          let juntos = 0;
+          novos.forEach(function (n) {
+            if (actuais.indexOf(n) === -1 && actuais.length < 300) {
+              actuais.push(n);
+              juntos++;
+            }
+          });
+
+          if (!juntos) {
+            return responder(res, 200, {
+              ok: true, juntos: 0, total: actuais.length,
+              nome: l['Name'] || '', ja_estava: true
+            });
+          }
+
+          bubble('PATCH', '/playlist/' + encodeURIComponent(id), {
+            'Track IDs': actuais.join(',')
+          }, function (e4) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, {
+              ok: true, juntos: juntos, total: actuais.length, nome: l['Name'] || ''
+            });
+          });
+        });
+      });
+    });
+  }
+
+  /* apaga uma lista, sem tocar nos ficheiros */
+  if (rota === '/playlist-delete' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      const id = String(p.id || '').trim();
+      if (!dono || !id) return responder(res, 400, { erro: 'Dados em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        bubble('GET', '/playlist/' + encodeURIComponent(id), null, function (e3, jl) {
+          if (e3) return responder(res, 404, { erro: 'Lista nao encontrada.' });
+          const l = (jl && jl.response) || jl;
+          if (String(l['Owner']) !== String(u.id)) {
+            return responder(res, 403, { erro: 'Esta lista nao e tua.' });
+          }
+
+          bubble('DELETE', '/playlist/' + encodeURIComponent(id), null, function (e4) {
+            if (e4) return responder(res, 502, { erro: e4.message });
+            responder(res, 200, { ok: true });
+          });
+        });
+      });
+    });
+  }
+
+  /* todo o audio e video do utilizador, para tocar sem criar lista */
+  if (rota === '/media' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      const dono = String(p.owner || '').trim();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const cs = [
+          { key: 'Owner', constraint_type: 'equals', value: u.id },
+          { key: 'Is Deleted', constraint_type: 'equals', value: false }
+        ];
+
+        buscarTudo('/stored file', cs, '&sort_field=Created Date&descending=true', function (e3, todos) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          const audio = [], video = [];
+          todos.forEach(function (f) {
+            const t = f['File Type'];
+            if (t === 'Audio') audio.push(mapear(f));
+            else if (t === 'Video' && f['Status'] === 'Ready') video.push(mapear(f));
+          });
+
+          responder(res, 200, { ok: true, audio: audio, video: video });
+        });
+      });
+    });
+  }
   responder(res, 404, { erro: 'Caminho desconhecido.', rota: rota });
 });
 
