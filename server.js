@@ -2917,6 +2917,67 @@ const servidor = http.createServer(function (req, res) {
       });
     });
   }
+    /* ---------- procurar em todos os ficheiros ---------- */
+  if (rota === '/search' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      const dono = String(p.owner || '').trim();
+      const termo = String(p.q || '').trim().toLowerCase();
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+      if (termo.length < 2) {
+        return responder(res, 200, { ok: true, ficheiros: [], pastas: [], termo: termo });
+      }
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const naLixeira = p.trash === true;
+
+        const cs = [
+          { key: 'Owner', constraint_type: 'equals', value: u.id },
+          { key: 'Is Deleted', constraint_type: 'equals', value: naLixeira }
+        ];
+
+        buscarTudo('/stored file', cs, '&sort_field=Created Date&descending=true', function (e3, todos) {
+          if (e3) return responder(res, 502, { erro: e3.message });
+
+          /* procura no nome e na extensao */
+          const achados = todos.filter(function (f) {
+            const nome = String(f['Original Name'] || f['Name'] || '').toLowerCase();
+            const ext = String(f['Extension'] || '').toLowerCase();
+            return nome.indexOf(termo) !== -1 || ext === termo;
+          });
+
+          const cp = [
+            { key: 'Owner', constraint_type: 'equals', value: u.id },
+            { key: 'Is Deleted', constraint_type: 'equals', value: false }
+          ];
+
+          bubble('GET', '/folder' + constraints(cp) + '&limit=200&sort_field=Name',
+            null, function (e4, jp) {
+            const pastas = e4 ? [] :
+              (((jp || {}).response || {}).results || [])
+                .filter(function (d) {
+                  return String(d['Name'] || '').toLowerCase().indexOf(termo) !== -1;
+                })
+                .map(function (d) {
+                  return { id: d._id, nome: d['Name'] || '', caminho: d['Path'] || '' };
+                });
+
+            responder(res, 200, {
+              ok: true,
+              termo: termo,
+              ficheiros: achados.slice(0, 120).map(mapear),
+              pastas: pastas.slice(0, 30),
+              total: achados.length
+            });
+          });
+        });
+      });
+    });
+  }
+  
   responder(res, 404, { erro: 'Caminho desconhecido.', rota: rota });
 });
 
