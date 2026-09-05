@@ -3211,6 +3211,28 @@ const servidor = http.createServer(function (req, res) {
       });
     });
   }
+    /* ---------- ESTADO DO PAGAMENTO CARTÃO ---------- */
+  if (rota === '/payment-status' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      var referencia = String(p.reference || '').trim();
+      if (!referencia) return responder(res, 400, { erro: 'Referencia em falta.' });
+
+      var c = [{ key: 'reference', constraint_type: 'equals', value: referencia }];
+      bubble('GET', '/card_payment_pending' + constraints(c) + '&limit=1', null, function (e2, j2) {
+        if (e2) return responder(res, 502, { erro: 'Erro ao procurar pagamento.' });
+
+        var lista = (((j2 || {}).response || {}).results || []);
+        if (!lista.length) return responder(res, 404, { erro: 'Pagamento nao encontrado.', status: 'not_found' });
+
+        var pendente = lista[0];
+        var status = String(pendente['status'] || 'pending').toLowerCase();
+
+        responder(res, 200, { ok: true, status: status, referencia: referencia });
+      });
+    });
+  }
 
   responder(res, 404, { erro: 'Caminho desconhecido.', rota: rota });
 });
