@@ -20,6 +20,7 @@ const OO_SECRET = String(process.env.ONLYOFFICE_SECRET || '').trim();
 const SELF_URL = (process.env.SELF_URL || '').replace(/\/+$/, '');
 
 const MOZ_WALLET = String(process.env.MOZ_WALLET || '').trim();
+const WEBHOOK_SECRET = String(process.env.WEBHOOK_SECRET || '').trim();
 
 const PORTA = process.env.PORT || 8080;
 
@@ -1162,14 +1163,15 @@ const servidor = http.createServer(function (req, res) {
   if (rota === '/' || rota === '') {
     return responder(res, 200, {
       servico: 'bagsecurity-proxy',
-      versao: 'container-11',
+      versao: 'container-12',
       storage: Boolean(ZONE && PASS && HOST),
       bubble: Boolean(BUBBLE_BASE && BUBBLE_TOKEN),
       cdn_assinado: Boolean(CDN_KEY),
       stream: Boolean(STREAM_LIB && STREAM_KEY && STREAM_CDN),
       office: Boolean(OO_URL && OO_SECRET),
       pagamento: Boolean(MOZ_WALLET),
-      envio: true
+      envio: true,
+      webhook_card: Boolean(WEBHOOK_SECRET)
     });
   }
 
@@ -1414,6 +1416,258 @@ const servidor = http.createServer(function (req, res) {
                   : u.base + u.extra + Number(item['Bytes'] || 0)
               });
             });
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- INICIAR PAGAMENTO CARTÃO ---------- */
+  if (rota === '/pay-card' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+      if (!MOZ_WALLET) return responder(res, 500, { erro: 'Pagamentos nao configurados.' });
+
+      const dono = String(p.owner || '').trim();
+      const tipo = String(p.tipo || '').toLowerCase().trim();
+      const itemId = String(p.item_id || '').trim();
+
+      if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
+      if (['plan', 'pack'].indexOf(tipo) === -1) {
+        return responder(res, 400, { erro: 'Tipo de compra invalido.' });
+      }
+      if (!itemId) return responder(res, 400, { erro: 'Item em falta.' });
+
+      carregarUtilizador(dono, function (e2, u) {
+        if (e2) return responder(res, 403, { erro: e2.message });
+
+        const caminhoItem = tipo === 'plan'
+          ? '/plan/' + encodeURIComponent(itemId)
+          : '/storage pack/' + encodeURIComponent(itemId);
+
+        bubble('GET', caminhoItem, null, function (e3, ji) {
+          if (e3) return responder(res, 404, { erro: 'Item nao encontrado.' });
+          const item = (ji && ji.response) || ji;
+
+          if (item['Is Active'] === false) {
+            return responder(res, 400, { erro: 'Este item ja nao esta disponivel.' });
+          }
+
+          const nome = item['Name'] || '';
+          const anual = p.anual === true;
+          let valor;
+
+          if (tipo === 'plan') {
+            valor = Number(item['Price MZN'] || 0);
+          } else {
+            valor = anual
+              ? Number(item['Price Year MZN'] || 0)
+              : Number(item['Price MZN'] || 0);
+          }
+
+          if (!valor || valor <= 0) {
+            return responder(res, 400, {
+              erro: 'Este item nao tem preco definido. Fala connosco para negociar.'
+            });
+          }
+
+          /* referencia unica para este pagamento */
+          const referencia = 'BS-' + Date.now() + '-' + Math.floor(Math.random() * 100000);
+
+          /* return_url com user e plano para a pagina /payment saber o que activar */
+          const returnUrl = 'https://bag-security.com/payment?u='
+            + encodeURIComponent(u.id)
+            + '&p=' + encodeURIComponent(itemId)
+            + '&t=' + encodeURIComponent(tipo)
+            + '&ref=' + encodeURIComponent(referencia);
+
+          /* guardar pendente no Bubble */
+          bubble('POST', '/card_payment_pending', {
+            'user_id': u.id,
+            'plano': itemId,
+            'valor': valor,
+            'reference': referencia,
+            'status': 'pending',
+            'created_date': new Date().toISOString()
+          }, function (e4) {
+            if (e4) return responder(res, 502, { erro: 'Nao foi possivel registar o pagamento.' });
+
+            /* chamar a MoPayment */
+            const payload = JSON.stringify({
+              valor: String(valor),
+              nome_cliente: u.nome,
+              carteira: MOZ_WALLET,
+              return_url: returnUrl,
+              nome_producto: 'Bag Security - ' + nome
+            });
+
+            const pedido = https.request({
+              hostname: 'mozpayment.co.mz',
+              path: '/api/1.1/wf/bankpayment',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload)
+              }
+            }, function (r) {
+              let texto = '';
+              r.on('data', function (c) { texto += c; });
+              r.on('end', function () {
+                let j = null;
+                try { j = JSON.parse(texto); } catch (e) { j = null; }
+
+                if (!j) {
+                  return responder(res, 502, {
+                    erro: 'Resposta ilegivel da MoPayment.',
+                    detalhe: 'HTTP ' + r.statusCode + ' | ' + String(texto).substring(0, 300)
+                  });
+                }
+
+                /* a MoPayment devolve o URL de pagamento */
+                const urlPagamento = (j.response && j.response.payment_url)
+                  || j.payment_url || j.url || '';
+
+                if (!urlPagamento) {
+                  return responder(res, 502, {
+                    erro: 'A MoPayment nao devolveu o link de pagamento.',
+                    detalhe: JSON.stringify(j).substring(0, 300)
+                  });
+                }
+
+                responder(res, 200, {
+                  ok: true,
+                  url: urlPagamento,
+                  referencia: referencia,
+                  valor: valor,
+                  item: nome
+                });
+              });
+            });
+
+            pedido.setTimeout(30000, function () {
+              pedido.destroy(new Error('MoPayment demorou demasiado.'));
+            });
+            pedido.on('error', function (e) {
+              responder(res, 502, { erro: e.message });
+            });
+            pedido.write(payload);
+            pedido.end();
+          });
+        });
+      });
+    });
+  }
+
+  /* ---------- WEBHOOK CARTÃO (MoPayment → proxy → Bubble) ---------- */
+  if (rota === '/webhook-card' && metodo === 'POST') {
+    return lerJson(req, function (err, p) {
+      if (err) return responder(res, 400, { erro: 'JSON invalido.' });
+
+      /* verificar token secreto no cabeçalho */
+      const tokenRecebido = String(req.headers['x-webhook-secret'] || '').trim();
+      if (!WEBHOOK_SECRET || tokenRecebido !== WEBHOOK_SECRET) {
+        return responder(res, 401, { erro: 'Nao autorizado.' });
+      }
+
+      const referencia = String(p.reference || p.payment_id || '').trim();
+      const status = String(p.status || '').toUpperCase().trim();
+
+      if (!referencia) return responder(res, 400, { erro: 'Referencia em falta.' });
+
+      /* procurar o registo pendente pelo campo reference */
+      const c = [{ key: 'reference', constraint_type: 'equals', value: referencia }];
+      bubble('GET', '/card_payment_pending' + constraints(c) + '&limit=1', null, function (e2, j2) {
+        if (e2) return responder(res, 502, { erro: 'Erro ao procurar pagamento.' });
+
+        const lista = (((j2 || {}).response || {}).results || []);
+        if (!lista.length) return responder(res, 404, { erro: 'Pagamento nao encontrado.' });
+
+        const pendente = lista[0];
+
+        /* actualizar status no registo pendente */
+        bubble('PATCH', '/card_payment_pending/' + encodeURIComponent(pendente._id), {
+          'status': status === 'PAID' ? 'paid' : (status === 'FAILED' ? 'failed' : 'expired')
+        }, function () {});
+
+        /* só activar o plano se o pagamento foi bem sucedido */
+        if (status !== 'PAID') {
+          return responder(res, 200, { ok: true, ignorado: true, status: status });
+        }
+
+        const userId = String(pendente['user_id'] || '').trim();
+        const planoId = String(pendente['plano'] || '').trim();
+        const valor = Number(pendente['valor'] || 0);
+
+        if (!userId || !planoId) {
+          return responder(res, 400, { erro: 'Dados do pendente incompletos.' });
+        }
+
+        carregarUtilizador(userId, function (e3, u) {
+          if (e3) return responder(res, 502, { erro: 'Utilizador nao encontrado.' });
+
+          /* tentar carregar como plano primeiro */
+          bubble('GET', '/plan/' + encodeURIComponent(planoId), null, function (e4, jp) {
+            const ehPlano = !e4 && jp && ((jp.response || jp)['Name']);
+
+            if (ehPlano) {
+              const item = (jp.response || jp);
+              const mudanca = {
+                'Plan': planoId,
+                'Storage Limit Bytes': Number(item['Storage Limit Bytes'] || 0),
+                'Max File Size Bytes': Number(item['Max File Size Bytes'] || 0),
+                'Plan Started': new Date().toISOString(),
+                'Plan Expires': somaDias(u.expira, 30),
+                'Is Active': true
+              };
+
+              bubble('PATCH', '/user/' + encodeURIComponent(u.id), mudanca, function (e5) {
+                registarPagamento(u, {
+                  metodo: 'card',
+                  numero: '',
+                  valor: valor,
+                  tipo: 'plan',
+                  nome: item['Name'] || '',
+                  itemId: planoId,
+                  estado: e5 ? 'error' : 'success',
+                  transacao: String(p.transaction_id || p.payment_id || ''),
+                  mensagem: e5 ? ('Pago mas nao aplicado: ' + e5.message) : 'Pago via cartao',
+                  bruto: JSON.stringify(p).substring(0, 900)
+                });
+
+                responder(res, 200, { ok: true, activado: !e5, tipo: 'plan' });
+              });
+
+            } else {
+              /* tentar como pack de storage */
+              bubble('GET', '/storage pack/' + encodeURIComponent(planoId), null, function (e6, jk) {
+                if (e6) return responder(res, 404, { erro: 'Item nao encontrado.' });
+                const item = (jk.response || jk);
+
+                const mudanca = {
+                  'Extra Storage Bytes': u.extra + Number(item['Bytes'] || 0)
+                };
+                if (!u.expira || u.expirado) {
+                  mudanca['Plan Expires'] = somaDias(null, 30);
+                }
+
+                bubble('PATCH', '/user/' + encodeURIComponent(u.id), mudanca, function (e7) {
+                  registarPagamento(u, {
+                    metodo: 'card',
+                    numero: '',
+                    valor: valor,
+                    tipo: 'pack',
+                    nome: item['Name'] || '',
+                    itemId: planoId,
+                    estado: e7 ? 'error' : 'success',
+                    transacao: String(p.transaction_id || p.payment_id || ''),
+                    mensagem: e7 ? ('Pago mas nao aplicado: ' + e7.message) : 'Pago via cartao',
+                    bruto: JSON.stringify(p).substring(0, 900)
+                  });
+
+                  responder(res, 200, { ok: true, activado: !e7, tipo: 'pack' });
+                });
+              });
+            }
           });
         });
       });
@@ -1746,7 +2000,6 @@ const servidor = http.createServer(function (req, res) {
 
           const caminho = f['Bunny Path'] || '';
           const bloqueio = porqueBloqueado(u);
-          /* nao deixa editar se o ficheiro aponta para o de outra pessoa */
           const ligado = f['Shares Storage'] === true;
           const podeEditar = p.edit === true && ooEditavel(ext) && !bloqueio && !ligado;
 
@@ -2228,13 +2481,11 @@ const servidor = http.createServer(function (req, res) {
             });
           }
 
-          /* se aponta para o ficheiro de outra pessoa, nao apaga do Bunny */
           if (f['Shares Storage'] === true) return terminar();
 
           const caminhoOriginal = f['Bunny Path'] || '';
           const vid = f['Bunny Video ID'];
 
-          /* verifica se alguem recebeu copia ligada a este ficheiro */
           const cLigadas = [
             { key: 'Source File', constraint_type: 'equals', value: f._id },
             { key: 'Shares Storage', constraint_type: 'equals', value: true },
@@ -2244,7 +2495,6 @@ const servidor = http.createServer(function (req, res) {
           bubble('GET', '/stored file' + constraints(cLigadas) + '&limit=1', null, function (e6, jl) {
             const temLigadas = !e6 && (((jl || {}).response || {}).results || []).length > 0;
 
-            /* alguem ainda usa este ficheiro: nao apaga do Bunny */
             if (temLigadas) return terminar();
 
             if (vid) return stream('DELETE', '/videos/' + encodeURIComponent(vid), null, function () { terminar(); });
@@ -2473,7 +2723,6 @@ const servidor = http.createServer(function (req, res) {
 
   /* ================= CONTA E EMAIL ================= */
 
-  /* gera um codigo novo e envia por email */
   if (rota === '/signup-code' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2521,7 +2770,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* confirma o codigo escrito pela pessoa */
   if (rota === '/verify-code' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2577,12 +2825,10 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* avisa quem tem o plano a acabar — para correr uma vez por dia */
   if (rota === '/plan-warnings' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
 
-      /* protegido pelo segredo do container */
       const chave = String(p.key || '');
       if (!SEGREDO || chave !== SEGREDO) {
         return responder(res, 403, { erro: 'Nao autorizado.' });
@@ -2620,7 +2866,6 @@ const servidor = http.createServer(function (req, res) {
           });
         });
 
-        /* se todos foram saltados */
         setTimeout(function () {
           if (feitos === lista.length && !res.headersSent) {
             responder(res, 200, { ok: true, avisados: 0 });
@@ -2630,7 +2875,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* estado do email de um utilizador */
   if (rota === '/mail-status' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2650,9 +2894,9 @@ const servidor = http.createServer(function (req, res) {
       });
     });
   }
+
   /* ================= PLAYLISTS ================= */
 
-  /* lista as playlists do utilizador */
   if (rota === '/playlists' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2690,7 +2934,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* abre uma playlist com as faixas todas, pela ordem certa */
   if (rota === '/playlist' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2719,7 +2962,6 @@ const servidor = http.createServer(function (req, res) {
             });
           }
 
-          /* busca os ficheiros e devolve pela ordem guardada */
           const cs = [
             { key: 'Owner', constraint_type: 'equals', value: u.id },
             { key: 'Is Deleted', constraint_type: 'equals', value: false }
@@ -2747,7 +2989,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* cria ou muda uma playlist */
   if (rota === '/playlist-save' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2757,7 +2998,6 @@ const servidor = http.createServer(function (req, res) {
       if (!dono) return responder(res, 403, { erro: 'Utilizador em falta.' });
       if (!id && !nome) return responder(res, 400, { erro: 'Escreve um nome para a lista.' });
 
-      /* limpa e limita os identificadores das faixas */
       const ids = (Array.isArray(p.tracks) ? p.tracks : [])
         .map(function (s) { return String(s || '').trim(); })
         .filter(Boolean)
@@ -2769,7 +3009,6 @@ const servidor = http.createServer(function (req, res) {
         const tipo = ['audio', 'video', 'mix'].indexOf(String(p.kind || '')) !== -1
           ? String(p.kind) : 'mix';
 
-        /* actualizar uma existente */
         if (id) {
           return bubble('GET', '/playlist/' + encodeURIComponent(id), null, function (e3, jl) {
             if (e3) return responder(res, 404, { erro: 'Lista nao encontrada.' });
@@ -2790,7 +3029,6 @@ const servidor = http.createServer(function (req, res) {
           });
         }
 
-        /* criar nova */
         bubble('POST', '/playlist', {
           'Name': nome,
           'Owner': u.id,
@@ -2805,7 +3043,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* acrescenta faixas a uma lista, sem repetir */
   if (rota === '/playlist-add' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2860,7 +3097,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* apaga uma lista, sem tocar nos ficheiros */
   if (rota === '/playlist-delete' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2887,7 +3123,6 @@ const servidor = http.createServer(function (req, res) {
     });
   }
 
-  /* todo o audio e video do utilizador, para tocar sem criar lista */
   if (rota === '/media' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2917,7 +3152,7 @@ const servidor = http.createServer(function (req, res) {
       });
     });
   }
-    /* ---------- procurar em todos os ficheiros ---------- */
+
   if (rota === '/search' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
@@ -2942,7 +3177,6 @@ const servidor = http.createServer(function (req, res) {
         buscarTudo('/stored file', cs, '&sort_field=Created Date&descending=true', function (e3, todos) {
           if (e3) return responder(res, 502, { erro: e3.message });
 
-          /* procura no nome e na extensao */
           const achados = todos.filter(function (f) {
             const nome = String(f['Original Name'] || f['Name'] || '').toLowerCase();
             const ext = String(f['Extension'] || '').toLowerCase();
@@ -2977,7 +3211,7 @@ const servidor = http.createServer(function (req, res) {
       });
     });
   }
-  
+
   responder(res, 404, { erro: 'Caminho desconhecido.', rota: rota });
 });
 
