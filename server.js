@@ -1559,15 +1559,10 @@ const servidor = http.createServer(function (req, res) {
   }
 
   /* ---------- WEBHOOK CARTÃO (MoPayment → proxy → Bubble) ---------- */
-  if (rota === '/webhook-card' && metodo === 'POST') {
+  if (rota === '/wh-card-x9k2mq7p' && metodo === 'POST') {
     return lerJson(req, function (err, p) {
       if (err) return responder(res, 400, { erro: 'JSON invalido.' });
 
-      /* verificar token secreto no cabeçalho */
-      const tokenRecebido = String(req.headers['x-webhook-secret'] || '').trim();
-      if (!WEBHOOK_SECRET || tokenRecebido !== WEBHOOK_SECRET) {
-        return responder(res, 401, { erro: 'Nao autorizado.' });
-      }
 
       const referencia = String(p.reference || p.payment_id || '').trim();
       const status = String(p.status || '').toUpperCase().trim();
